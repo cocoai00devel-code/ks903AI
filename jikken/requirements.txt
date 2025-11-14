@@ -1,0 +1,4 @@
+# requirements.txt
+gradio
+transformers
+torch # または tensorflow, numpy など
