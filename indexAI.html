@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>AI & QRコード ハイブリッドUI</title>
+    <script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            background: #0f0f0f;
+            font-family: 'Segoe UI', sans-serif;
+            overflow: hidden;
+        }
+
+        /* 1. 波形アニメーションの背景 */
+        #waveCanvas {
+            position: fixed;
+            top: 0; left: 0;
+            width: 100vw;
+            height: 100vh;
+            z-index: 0;
+        }
+
+        /* 2. UIコンテナの調整 (下部に固定) */
+        #ui {
+            position: absolute;
+            bottom: 5%; /* 画面下から少し上へ */
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            flex-direction: column; /* 縦並びにする */
+            align-items: center;
+            gap: 1.5rem;
+            z-index: 10;
+        }
+
+        /* 3. QRコードエリアのスタイル */
+        #qrcode-area {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+            background: rgba(0, 0, 0, 0.5); /* 背景の波形が透けるように半透明に */
+            border-radius: 12px;
+            backdrop-filter: blur(5px);
+            box-shadow: 0 0 20px rgba(0, 255, 255, 0.3); /* ネオン風の影 */
+        }
+        #qrcode {
+            width: 200px;
+            height: 200px;
+            margin: 0 auto 15px;
+            border: 2px solid #00ffff; /* ネオンカラーの枠線 */
+            padding: 5px;
+            background-color: #fff;
+        }
+        #placeholder {
+            width: 200px;
+            height: 200px;
+            line-height: 200px;
+            border: 2px dashed #00ffff;
+            color: #00ffff;
+            font-size: 14px;
+            font-style: italic;
+        }
+
+        /* 4. 入力とボタンのスタイル */
+        #input-controls {
+            display: flex;
+            gap: 1rem;
+        }
+        #messageInput {
+            width: 400px;
+            padding: 1rem;
+            font-size: 1.2rem;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(0, 255, 255, 0.5); /* ネオンカラーの枠線 */
+            color: #fff;
+            border-radius: 8px;
+            backdrop-filter: blur(10px);
+            outline: none;
+        }
+        #messageInput::placeholder {
+            color: rgba(255, 255, 255, 0.4);
+        }
+        #sendBtn, #downloadBtn {
+            padding: 1rem 2rem;
+            font-size: 1.2rem;
+            color: #0f0f0f;
+            background: #00ffff; /* 送信ボタンをネオンカラーに */
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            backdrop-filter: blur(10px);
+            transition: background 0.3s;
+            box-shadow: 0 0 10px #00ffff;
+        }
+        #sendBtn:hover, #downloadBtn:hover {
+            background: #33ffff;
+        }
+        #downloadBtn:disabled {
+            background: #555;
+            color: #ccc;
+            box-shadow: none;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="waveCanvas"></canvas>
+    
+    <div id="ui">
+        <div id="qrcode-area">
+            <div id="qrcode"></div>
+            <div id="placeholder">メールアドレスを入力してください</div>
+            <button id="downloadBtn" disabled>QRコードをダウンロード (PNG)</button>
+        </div>
+
+        <div id="input-controls">
+            <input type="text" id="messageInput" placeholder="メールアドレスを入力" value="your.email@example.com">
+            <button id="sendBtn">QRコード生成/更新</button>
+        </div>
+    </div>
+
+    <script>
+        // --- 1. アニメーション関連 ---
+        const canvas = document.getElementById("waveCanvas");
+        const ctx = canvas.getContext("2d");
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+
+        let bars = [];
+        const barCount = 40; // バーの数を増やした
+        const barWidth = 8;
+        const waveY = canvas.height / 2;
+        let animationFrameId; // アニメーションIDを保持するための変数
+
+        function createBars() {
+            bars = [];
+            const startX = canvas.width / 2 - (barCount * barWidth) / 2;
+            for (let i = 0; i < barCount; i++) {
+                bars.push({
+                    x: startX + i * barWidth,
+                    height: Math.random() * 40 + 10,
+                    color: "#00ffff"
+                });
+            }
+        }
+
+        function drawBars() {
+            // 背景のクリアはanimateBars内で行う
+            bars.forEach(bar => {
+                ctx.fillStyle = bar.color;
+                // 波紋のような視覚効果を出すため、中央を波の始点にする
+                ctx.fillRect(bar.x, waveY - bar.height / 2, barWidth - 2, bar.height); 
+            });
+        }
+
+        function animateBars() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height); // フレームごとにクリア
+            bars.forEach(bar => {
+                // 高さのランダムな変化
+                bar.height = Math.max(5, bar.height + (Math.random() * 6 - 3)); 
+            });
+            drawBars();
+            animationFrameId = requestAnimationFrame(animateBars);
+        }
+        
+        // --- 2. QRコード関連 ---
+        const qrInput = document.getElementById("messageInput");
+        const qrcodeContainer = document.getElementById("qrcode");
+        const placeholder = document.getElementById("placeholder");
+        const downloadBtn = document.getElementById("downloadBtn");
+        const sendBtn = document.getElementById("sendBtn");
+        
+        // qrcode.jsのインスタンスを初期化
+        const qr = new QRCode(qrcodeContainer, {
+            text: "", 
+            width: 200,
+            height: 200,
+            correctLevel: QRCode.CorrectLevel.H
+        });
+
+        // QRコードの表示/非表示を切り替える関数
+        function toggleDisplay(showQr) {
+            if (showQr) {
+                qrcodeContainer.style.display = 'block';
+                placeholder.style.display = 'none';
+                downloadBtn.disabled = false;
+            } else {
+                qrcodeContainer.style.display = 'none';
+                placeholder.style.display = 'block';
+                downloadBtn.disabled = true;
+            }
+        }
+
+        // 入力値が変わるたびにQRコードを更新するメイン関数
+        function updateQRCode() {
+            const emailAddress = qrInput.value.trim();
+            
+            if (emailAddress === "") {
+                toggleDisplay(false);
+                return;
+            }
+            
+            // mailto: スキーマを使用してメール作成QRコードを生成
+            const mailtoLink = "mailto:" + emailAddress;
+
+            qr.makeCode(mailtoLink);
+            toggleDisplay(true);
+            
+            // AIチャットの「送信中...」表示は行わない
+        }
+        
+        // ダウンロード機能
+        downloadBtn.addEventListener('click', () => {
+            const canvasElement = qrcodeContainer.querySelector('canvas');
+            if (canvasElement) {
+                const image = canvasElement.toDataURL("image/png");
+                const link = document.createElement('a');
+                link.href = image;
+                link.download = 'qrcode_mail_' + qrInput.value.substring(0, 10).replace(/[^a-zA-Z0-9]/g, '') + '.png';
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            }
+        });
+
+        // --- 3. イベントと初期化 ---
+
+        // 入力欄の内容が変更されるたびにQRコードを更新 (リアルタイム生成)
+        qrInput.addEventListener('input', updateQRCode);
+        
+        // 送信ボタンが押されたら、強制的に更新（主に Enter キーでの操作に対応）
+        sendBtn.addEventListener("click", updateQRCode);
+
+        // 元のAIチャットのロジックはコメントアウト。必要であれば再利用可能
+        /*
+        document.getElementById("sendBtn").addEventListener("click", async () => {
+             // ... AI API呼び出しロジック ...
+        });
+        */
+
+        // 初期化処理
+        createBars();
+        animateBars();
+        qrInput.focus();
+        updateQRCode(); // 初回ロード時に初期値でQRコードを生成
+    </script>
+</body>
+</html>

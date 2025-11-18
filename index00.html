@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>AI音声入力アシスタントUI (文章読み上げ版)</title>
+    <style>
+        body {
+            margin: 0;
+            background: #0f0f0f;
+            font-family: 'Segoe UI', sans-serif;
+            overflow: hidden;
+        }
+
+        /* 1. 波形アニメーションの背景 */
+        #waveCanvas {
+            position: fixed;
+            top: 0; left: 0;
+            width: 100vw;
+            height: 100vh;
+            z-index: 0;
+        }
+
+        /* 2. UIコンテナの調整 (下部に固定) */
+        #ui {
+            position: absolute;
+            bottom: 5%;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 1.5rem;
+            z-index: 10;
+        }
+
+        /* 3. ステータスエリアの定義 */
+        #status-area {
+            padding: 15px 30px;
+            background: rgba(0, 0, 0, 0.5);
+            border-radius: 12px;
+            backdrop-filter: blur(5px);
+            box-shadow: 0 0 20px rgba(0, 255, 255, 0.3);
+            color: #00ffff;
+            font-size: 1.5rem;
+            font-weight: bold;
+            min-height: 40px; 
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        /* 4. 入力とボタンのスタイル */
+        #input-controls {
+            display: flex;
+            gap: 1rem;
+        }
+        #messageInput {
+            width: 400px;
+            padding: 1rem;
+            font-size: 1.2rem;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(0, 255, 255, 0.5);
+            color: #fff;
+            border-radius: 8px;
+            backdrop-filter: blur(10px);
+            outline: none;
+        }
+        #messageInput::placeholder {
+            color: rgba(255, 255, 255, 0.4);
+        }
+        #sendBtn {
+            padding: 1rem 2rem;
+            font-size: 1.2rem;
+            color: #0f0f0f;
+            background: #00ffff;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            backdrop-filter: blur(10px);
+            transition: background 0.3s;
+            box-shadow: 0 0 10px #00ffff;
+        }
+        #sendBtn:hover {
+            background: #33ffff;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="waveCanvas"></canvas>
+    
+    <div id="ui">
+        <div id="status-area">
+            AIアシスタント待機中...
+        </div>
+
+        <div id="input-controls">
+            <input type="text" id="messageInput" placeholder="ここに文章を入力してください" value="">
+            <button id="sendBtn">リセット</button>
+        </div>
+    </div>
+
+    <script>
+        // --- 1. アニメーション関連 ---
+        const canvas = document.getElementById("waveCanvas");
+        const ctx = canvas.getContext("2d");
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+
+        let bars = [];
+        const barCount = 40;
+        const barWidth = 8;
+        const waveY = canvas.height / 2;
+        let animationFrameId;
+        let isSpeaking = false; 
+
+        function createBars() {
+            bars = [];
+            const startX = canvas.width / 2 - (barCount * barWidth) / 2;
+            for (let i = 0; i < barCount; i++) {
+                bars.push({
+                    x: startX + i * barWidth,
+                    height: 10,
+                    color: "#00ffff"
+                });
+            }
+        }
+
+        function drawBars() {
+            bars.forEach(bar => {
+                ctx.fillStyle = bar.color;
+                ctx.fillRect(bar.x, waveY - bar.height / 2, barWidth - 2, bar.height); 
+            });
+        }
+
+        function animateBars() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            bars.forEach(bar => {
+                let targetHeight;
+                if (isSpeaking) {
+                    // 読み上げ中は高さをダイナミックに変化させる
+                    targetHeight = Math.random() * 80 + 20; 
+                } else {
+                    // 待機中は徐々に低い静かな状態に戻る
+                    targetHeight = 10 + Math.random() * 10;
+                }
+                
+                // スムーズな遷移
+                bar.height += (targetHeight - bar.height) * 0.15;
+            });
+            
+            drawBars();
+            animationFrameId = requestAnimationFrame(animateBars);
+        }
+        
+        // --- 2. 音声読み上げ関連 ---
+        const qrInput = document.getElementById("messageInput");
+        const statusArea = document.getElementById("status-area");
+        const sendBtn = document.getElementById("sendBtn");
+        
+        const synth = window.speechSynthesis;
+        let utterance = null;
+        let currentTextToSpeak = ''; // 最後に読み上げを開始した文章を保持
+
+        // 読み上げステータスの更新
+        function updateStatus(message, color = '#00ffff') {
+            statusArea.textContent = message;
+            statusArea.style.color = color;
+            statusArea.style.boxShadow = `0 0 20px ${color}80`;
+        }
+
+        // 入力された文章全体を読み上げる関数
+        function speakSentence(text) {
+            // テキストが空か、既に同じテキストの読み上げが開始されている場合は何もしない
+            if (text.trim() === '' || text === currentTextToSpeak) {
+                return;
+            }
+
+            // 新しい読み上げが開始されるので、現在の読み上げをキャンセル
+            if (synth.speaking) {
+                synth.cancel();
+            }
+            
+            currentTextToSpeak = text; // 新しい文章を記憶
+
+            utterance = new SpeechSynthesisUtterance(text);
+            utterance.lang = 'ja-JP'; // 日本語を設定
+            utterance.rate = 1.0; // 読み上げ速度を標準に戻す (1文字ずつではないため)
+
+            utterance.onstart = () => {
+                isSpeaking = true;
+                // 読み上げ中の文章を一部表示
+                const display = text.length > 20 ? text.substring(0, 20) + '...' : text;
+                updateStatus(`文章を読み上げ中: 「${display}」`, '#00ffaa');
+            };
+            
+            utterance.onend = () => {
+                isSpeaking = false;
+                updateStatus('AIアシスタント待機中...');
+            };
+
+            utterance.onerror = (event) => {
+                console.error('Speech Synthesis Error:', event);
+                isSpeaking = false;
+                updateStatus('読み上げエラーが発生しました', '#ff0000');
+            };
+
+            synth.speak(utterance);
+        }
+
+        // 入力イベントリスナー: 文章全体を読み上げるように変更
+        qrInput.addEventListener('input', (event) => {
+            const currentText = qrInput.value;
+            
+            if (currentText.trim() !== "") {
+                // 入力された文章全体を読み上げ関数に渡す
+                speakSentence(currentText); 
+            } else {
+                // 全て削除された場合
+                if (synth.speaking) {
+                    synth.cancel();
+                }
+                isSpeaking = false;
+                currentTextToSpeak = '';
+                updateStatus('AIアシスタント待機中...');
+            }
+        });
+        
+        // リセットボタンの機能
+        sendBtn.addEventListener("click", () => {
+            qrInput.value = ""; // 入力欄を空にする
+            if (synth.speaking) {
+                synth.cancel(); // 読み上げを停止
+            }
+            isSpeaking = false;
+            currentTextToSpeak = '';
+            updateStatus('リセットしました。入力をお待ちしています...');
+            qrInput.focus();
+        });
+
+        // --- 3. 初期化 ---
+        createBars();
+        animateBars();
+        qrInput.focus();
+        updateStatus('AIアシスタント待機中...');
+
+    </script>
+</body>
+</html>
