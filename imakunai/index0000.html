@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>AI音声アシスタント（ブラウザ最適化）</title>
+<style>
+body { margin: 0; background: #0f0f0f; font-family: 'Segoe UI'; overflow: hidden; }
+#ui { position: absolute; bottom: 5%; left: 50%; transform: translateX(-50%);
+      display: flex; flex-direction: column; align-items: center; gap: 1.5rem; z-index: 10; }
+#status-area { padding: 15px 30px; background: rgba(0,0,0,0.5); border-radius: 12px;
+               color: #00ffff; font-size: 1.5rem; font-weight: bold; box-shadow: 0 0 20px #00ffff50; }
+#input-controls { display: flex; gap: 1rem; }
+#messageInput { width: 400px; padding: 1rem; font-size: 1.2rem;
+                background: rgba(255,255,255,0.05); border: 1px solid #00ffff80;
+                color: #fff; border-radius: 8px; outline: none; }
+button { padding: 1rem 2rem; font-size: 1.2rem; border-radius: 8px; border: none; cursor: pointer; }
+#micBtn { background: #00ffaa; box-shadow: 0 0 10px #00ffaa; }
+#micBtn.active { background: #ff5555; color: #fff; }
+#sendBtn { background: #00ffff; color: #000; }
+canvas { position: fixed; top:0; left:0; width:100vw; height:100vh; z-index:0; }
+</style>
+</head>
+<body>
+<canvas id="waveCanvas"></canvas>
+<div id="ui">
+    <div id="status-area">AIアシスタント待機中...</div>
+    <div id="input-controls">
+        <input id="messageInput" placeholder="話しかけてください...">
+        <button id="micBtn">🎤 音声入力</button>
+        <button id="sendBtn">リセット</button>
+    </div>
+</div>
+<script>
+const canvas = document.getElementById("waveCanvas");
+const ctx = canvas.getContext("2d");
+canvas.width = innerWidth; canvas.height = innerHeight;
+let bars = [], barCount = 40, barWidth = 8, isSpeaking = false;
+const waveY = canvas.height / 2;
+function createBars(){const startX=canvas.width/2-(barCount*barWidth)/2;
+bars=[];for(let i=0;i<barCount;i++)bars.push({x:startX+i*barWidth,h:10});}
+function animate(){ctx.clearRect(0,0,canvas.width,canvas.height);
+bars.forEach(b=>{let t=isSpeaking?Math.random()*80+20:10+Math.random()*10;
+b.h+=(t-b.h)*0.15;ctx.fillStyle="#00ffff";ctx.fillRect(b.x,waveY-b.h/2,barWidth-2,b.h);});
+requestAnimationFrame(animate);}
+createBars();animate();
+
+const synth = speechSynthesis;
+const status = document.getElementById("status-area");
+const micBtn = document.getElementById("micBtn");
+const sendBtn = document.getElementById("sendBtn");
+const input = document.getElementById("messageInput");
+
+function updateStatus(msg,color="#00ffff"){status.textContent=msg;status.style.color=color;}
+
+function speak(text){
+    if(!text.trim())return;
+    if(synth.speaking)synth.cancel();
+    const u=new SpeechSynthesisUtterance(text);
+    u.lang='ja-JP';
+    u.onstart=()=>{isSpeaking=true;updateStatus("読み上げ中...","#00ffaa");};
+    u.onend=()=>{isSpeaking=false;updateStatus("AIアシスタント待機中...");};
+    synth.speak(u);
+}
+
+let recognition;
+if("webkitSpeechRecognition" in window){
+    const R=window.webkitSpeechRecognition;
+    recognition=new R();recognition.lang='ja-JP';
+    recognition.continuous=true;recognition.interimResults=true;
+    let lastFinal=""; let silenceTimer;
+    recognition.onstart=()=>{micBtn.classList.add('active');updateStatus("🎤 音声入力中...","#00ffaa");};
+    recognition.onresult=e=>{
+        let interim="",final="";for(let i=0;i<e.results.length;i++){
+            const t=e.results[i][0].transcript;
+            e.results[i].isFinal?final+=t:interim+=t;}
+        input.value=final||interim;
+        clearTimeout(silenceTimer);
+        silenceTimer=setTimeout(()=>{if(final && final!==lastFinal){speak(final);lastFinal=final;}},400);
+    };
+    recognition.onend=()=>{micBtn.classList.remove('active');updateStatus("AIアシスタント待機中...");};
+}
+micBtn.onclick=()=>{if(!recognition)return;micBtn.classList.contains('active')?recognition.stop():recognition.start();}
+sendBtn.onclick=()=>{if(recognition)recognition.stop();if(synth.speaking)synth.cancel();input.value="";
+isSpeaking=false;updateStatus("リセットしました。","#00ffff");};
+
+      # whisper_realtime_server.py
+import asyncio, websockets, base64, torch
+from faster_whisper import WhisperModel
+
+model = WhisperModel("small", device="cpu")
+
+async def handler(websocket):
+    async for message in websocket:
+        audio_data = base64.b64decode(message)
+        segments, _ = model.transcribe(audio_data, beam_size=1)
+        text = "".join([seg.text for seg in segments])
+        await websocket.send(text)
+
+async def main():
+    async with websockets.serve(handler, "0.0.0.0", 8765):
+        await asyncio.Future()
+
+asyncio.run(main())
+</script>
+</body>
+</html>

@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>AI音声入力アシスタントUI (PDF擬似学習版)</title>
+    <style>
+        body {
+            margin: 0;
+            background: #0f0f0f;
+            font-family: 'Segoe UI', sans-serif;
+            overflow: hidden;
+        }
+
+        /* 1. 波形アニメーションの背景 */
+        #waveCanvas {
+            position: fixed;
+            top: 0; left: 0;
+            width: 100vw;
+            height: 100vh;
+            z-index: 0;
+        }
+
+        /* 2. UIコンテナの調整 (下部に固定) */
+        #ui {
+            position: absolute;
+            bottom: 5%;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 1.5rem;
+            z-index: 10;
+        }
+
+        /* 3. ステータスエリアの定義 */
+        #status-area {
+            padding: 15px 30px;
+            background: rgba(0, 0, 0, 0.5);
+            border-radius: 12px;
+            backdrop-filter: blur(5px);
+            box-shadow: 0 0 20px rgba(0, 255, 255, 0.3);
+            color: #00ffff;
+            font-size: 1.5rem;
+            font-weight: bold;
+            min-height: 40px; 
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            max-width: 80vw;
+        }
+        
+        /* 4. 入力とボタンのスタイル */
+        #input-controls {
+            display: flex;
+            gap: 1rem;
+            align-items: center;
+        }
+        #messageInput {
+            width: 400px;
+            padding: 1rem;
+            font-size: 1.2rem;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(0, 255, 255, 0.5);
+            color: #fff;
+            border-radius: 8px;
+            backdrop-filter: blur(10px);
+            outline: none;
+        }
+        #messageInput::placeholder {
+            color: rgba(255, 255, 255, 0.4);
+        }
+        
+        /* ボタン共通スタイル */
+        .control-btn {
+            padding: 1rem 1.5rem;
+            font-size: 1.2rem;
+            color: #0f0f0f;
+            background: #00ffff;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            backdrop-filter: blur(10px);
+            transition: background 0.3s, box-shadow 0.3s;
+            box-shadow: 0 0 10px #00ffff;
+        }
+        .control-btn:hover {
+            background: #33ffff;
+        }
+        
+        /* PDFアップロード用ボタンを緑色に */
+        #pdfUploadBtn {
+            background: #00aa00;
+            box-shadow: 0 0 10px #00aa00;
+            color: #fff;
+        }
+        #pdfUploadBtn:hover {
+            background: #00cc00;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="waveCanvas"></canvas>
+    
+    <div id="ui">
+        <div id="status-area">
+            AIアシスタント待機中...
+        </div>
+
+        <div id="input-controls">
+            <input type="file" id="pdfFileInput" accept="application/pdf" style="display: none;">
+            <button id="pdfUploadBtn" class="control-btn">PDFをアップロード</button>
+            
+            <input type="text" id="messageInput" placeholder="キーワードを入力して内容を検索" value="">
+            <button id="resetBtn" class="control-btn" style="background: #ff5500; box-shadow: 0 0 10px #ff5500;">リセット</button>
+        </div>
+        
+        <p id="learnedTitleDisplay" style="color: #fff; font-size: 1rem;">学習済みタイトル: **なし**</p>
+    </div>
+
+    <script>
+        // --- 1. アニメーション関連 (変更なし) ---
+        const canvas = document.getElementById("waveCanvas");
+        const ctx = canvas.getContext("2d");
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+
+        let bars = [];
+        const barCount = 40;
+        const barWidth = 8;
+        const waveY = canvas.height / 2;
+        let animationFrameId;
+        let isSpeaking = false; 
+
+        function createBars() {
+            bars = [];
+            const startX = canvas.width / 2 - (barCount * barWidth) / 2;
+            for (let i = 0; i < barCount; i++) {
+                bars.push({
+                    x: startX + i * barWidth,
+                    height: 10,
+                    color: "#00ffff"
+                });
+            }
+        }
+
+        function drawBars() {
+            bars.forEach(bar => {
+                ctx.fillStyle = bar.color;
+                ctx.fillRect(bar.x, waveY - bar.height / 2, barWidth - 2, bar.height); 
+            });
+        }
+
+        function animateBars() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            bars.forEach(bar => {
+                let targetHeight;
+                if (isSpeaking) {
+                    targetHeight = Math.random() * 80 + 20; 
+                } else {
+                    targetHeight = 10 + Math.random() * 10;
+                }
+                
+                bar.height += (targetHeight - bar.height) * 0.15;
+            });
+            
+            drawBars();
+            animationFrameId = requestAnimationFrame(animateBars);
+        }
+        
+        // --- 2. 擬似学習と状態管理 (追加・修正部分) ---
+        const qrInput = document.getElementById("messageInput");
+        const statusArea = document.getElementById("status-area");
+        const resetBtn = document.getElementById("resetBtn");
+        const pdfFileInput = document.getElementById("pdfFileInput");
+        const pdfUploadBtn = document.getElementById("pdfUploadBtn");
+        const learnedTitleDisplay = document.getElementById("learnedTitleDisplay");
+        
+        const synth = window.speechSynthesis;
+        let utterance = null;
+        
+        // 💡 擬似学習用のデータストア
+        let learnedData = {
+            title: null,
+            content: null,
+            keywords: [] // 検索用のキーワード (例: "技術", "概要", "報告書")
+        };
+
+        // 読み上げステータスの更新
+        function updateStatus(message, color = '#00ffff') {
+            statusArea.textContent = message;
+            statusArea.style.color = color;
+            statusArea.style.boxShadow = `0 0 20px ${color}80`;
+        }
+
+        // 入力された文章全体を読み上げる関数
+        function speakSentence(text, callback = null) {
+            if (text.trim() === '') return;
+
+            if (synth.speaking) {
+                synth.cancel();
+            }
+            
+            utterance = new SpeechSynthesisUtterance(text);
+            utterance.lang = 'ja-JP'; 
+            utterance.rate = 1.0;
+
+            utterance.onstart = () => {
+                isSpeaking = true;
+                const display = text.length > 20 ? text.substring(0, 20) + '...' : text;
+                updateStatus(`音声出力中: 「${display}」`, '#00ffaa');
+            };
+            
+            utterance.onend = () => {
+                isSpeaking = false;
+                updateStatus(learnedData.title ? `学習済み: ${learnedData.title}` : 'AIアシスタント待機中...');
+                if (callback) callback();
+            };
+
+            utterance.onerror = (event) => {
+                console.error('Speech Synthesis Error:', event);
+                isSpeaking = false;
+                updateStatus('読み上げエラーが発生しました', '#ff0000');
+            };
+
+            synth.speak(utterance);
+        }
+
+        // 💡 PDFアップロード処理 (擬似学習)
+        pdfUploadBtn.addEventListener('click', () => {
+            pdfFileInput.click(); // ファイル選択ダイアログを開く
+        });
+
+        pdfFileInput.addEventListener('change', (event) => {
+            const file = event.target.files[0];
+            if (file && file.type === "application/pdf") {
+                
+                // --- 擬似的な学習処理 ---
+                const dummyTitle = `2025年度 第3四半期 AI技術開発報告書 (ファイル名: ${file.name})`;
+                const dummyContent = 
+                    "この報告書は、最新のAI技術であるニューラルネットワークの応用と、その社会実装へのロードマップについて詳細に述べています。特に、自然言語処理の分野での精度向上が著しく、今期の主要な目標を達成しました。来期は、画像認識とロボティクスへの統合を重点的に進める予定です。技術の概要やロードマップについて、いつでもキーワードで質問してください。";
+                
+                // データを学習済みとして設定
+                learnedData.title = dummyTitle;
+                learnedData.content = dummyContent;
+                learnedData.keywords = ["AI", "技術", "ニューラル", "言語処理", "ロボティクス", "ロードマップ", "概要"];
+                
+                learnedTitleDisplay.textContent = `学習済みタイトル: **${learnedData.title}**`;
+
+                // 学習完了の読み上げ
+                const speakMessage = `PDFのタイトルを学習しました。学習したタイトルは、「${learnedData.title}」です。`;
+                speakSentence(speakMessage);
+
+            } else {
+                updateStatus('PDFファイルを選択してください', '#ffaa00');
+            }
+        });
+        
+        // 💡 キーワード入力による検索と読み上げ
+        qrInput.addEventListener('input', (event) => {
+            const currentText = qrInput.value.trim().toLowerCase();
+            
+            if (currentText === "") {
+                if (synth.speaking) synth.cancel();
+                isSpeaking = false;
+                updateStatus(learnedData.title ? `学習済み: ${learnedData.title}` : 'AIアシスタント待機中...');
+                return;
+            }
+
+            if (learnedData.title && learnedData.content) {
+                // 1. キーワードが学習済みのタイトルと一致するかチェック
+                if (learnedData.title.toLowerCase().includes(currentText)) {
+                    speakSentence(`学習済みPDFの全体内容を読み上げます。${learnedData.content}`);
+                } 
+                // 2. キーワードが定義されたキーワードリストに含まれるかチェック
+                else if (learnedData.keywords.some(k => currentText.includes(k.toLowerCase()))) {
+                    speakSentence(`「${currentText}」に関連する内容を読み上げます。${learnedData.content.substring(0, 100)}... 詳細は報告書を参照してください。`);
+                }
+                // 3. どちらにも一致しない場合
+                else {
+                    updateStatus(`「${currentText}」に関する情報は学習内容に見つかりませんでした。`, '#ffaa00');
+                    if (synth.speaking) synth.cancel();
+                    isSpeaking = false;
+                }
+            } else {
+                // 学習データがない場合
+                speakSentence("まず、左側のボタンを押してPDFファイルをアップロードしてください。");
+            }
+        });
+        
+        // リセットボタンの機能
+        resetBtn.addEventListener("click", () => {
+            qrInput.value = ""; 
+            if (synth.speaking) {
+                synth.cancel(); 
+            }
+            isSpeaking = false;
+            
+            // 学習データをリセット
+            learnedData.title = null;
+            learnedData.content = null;
+            learnedData.keywords = [];
+            
+            learnedTitleDisplay.textContent = `学習済みタイトル: **なし**`;
+            updateStatus('システムをリセットしました。');
+            pdfFileInput.value = ''; // ファイル選択状態もリセット
+            qrInput.focus();
+        });
+
+        // --- 3. 初期化 ---
+        createBars();
+        animateBars();
+        qrInput.focus();
+        updateStatus('AIアシスタント待機中...');
+
+    </script>
+</body>
+</html>
