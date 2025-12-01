@@ -1,0 +1,75 @@
+/* style.css */
+
+/* --- 全体設定 --- */
+body {
+    font-family: 'Arial', sans-serif;
+    background-color: #1a1a2e; /* ダークな背景色 */
+    color: #ffffff;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    margin: 0;
+    padding: 20px;
+}
+
+/* --- UIコンテナ (ボードと情報) --- */
+#game-ui {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 20px; /* 要素間のスペース */
+}
+
+/* --- テトリスボード --- */
+#tetris-board {
+    /* 200px (幅) x 400px (高さ) は Tetrisの標準サイズ (10x20マス @20px/マス) */
+    background-color: #0d0d1a; 
+    border: 5px solid #4a4e69; /* ボードの枠線 */
+    box-shadow: 0 0 20px rgba(0, 255, 255, 0.5); /* ネオンのような光 */
+    border-radius: 5px;
+}
+
+/* --- スコア/情報表示 --- */
+#info {
+    font-size: 1.5em;
+    font-weight: bold;
+    padding: 10px 20px;
+    background-color: #2a2a4e;
+    border-radius: 5px;
+    min-width: 150px;
+    text-align: center;
+}
+
+/* --- スタート画面とボタン --- */
+#start-screen {
+    text-align: center;
+    padding: 50px;
+    border: 2px solid #ccc;
+    border-radius: 10px;
+    background-color: #2a2a4e;
+}
+
+#start-button {
+    padding: 15px 30px;
+    font-size: 1.2em;
+    cursor: pointer;
+    background-color: #00bcd4; /* シアン系の色 */
+    color: #000000;
+    border: none;
+    border-radius: 5px;
+    transition: background-color 0.3s;
+}
+
+#start-button:hover {
+    background-color: #00e5ff;
+}
+
+
+/* デバッグ用にカメラ映像を表示する場合 */
+#camera-video {
+    /* ボードの横に小さく表示 */
+    width: 320px; 
+    height: 240px;
+    transform: scaleX(-1); /* 左右反転 */
+    border: 1px solid red; /* デバッグ用の枠線 */
+}

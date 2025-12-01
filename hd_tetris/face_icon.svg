@@ -1,0 +1,8 @@
+<svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+  <circle cx="50" cy="40" r="30" fill="Yellow" stroke="black" stroke-width="2"/>
+  <circle cx="40" cy="35" r="8" fill="white" stroke="black" stroke-width="1.5"/>
+  <circle id="left-pupil" class="eye-animation" cx="40" cy="35" r="4" fill="blue"/> 
+  <circle cx="60" cy="35" r="8" fill="white" stroke="black" stroke-width="1.5"/>
+  <circle id="right-pupil" class="eye-animation" cx="60" cy="35" r="4" fill="blue"/> 
+  <path d="M 40 50 Q 50 60 60 50" fill="none" stroke="black" stroke-width="2"/>
+</svg>

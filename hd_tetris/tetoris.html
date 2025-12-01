@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>Hand Tracking Tetris</title>
+    <link rel="stylesheet" href="hd_tetris/style_tetris.css"> 
+        <link rel="icon" href="face_icon.svg" type="image/svg+xml">
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils"></script>
+</head>
+<body>
+    <div id="start-screen">
+        <h2>ハンドトラッキング・テトリス</h2>
+        <button id="start-button">ゲームスタート (カメラと音声の許可)</button>
+    </div>
+    
+    <div id="game-ui" style="display:none;">
+        <h1>HAND TRACKING TETRIS</h1>
+        <div id="info">スコア: <span id="score">0</span></div>
+        <canvas id="tetris-board"></canvas>
+        <video id="camera-video"></video>
+    </div>
+    
+    <script src="hd_tetris/audio.js" defer></script>
+    <script src="hd_tetris/tetris.js" defer></script>
+    <script src="hd_tetris/handtracker.js" defer></script>
+    
+    <script>
+        window.initializeGame = () => {
+            // 1. AudioModule の初期化と BGM 開始
+            if (window.AudioModule && window.AudioModule.init) {
+                 AudioModule.init();
+            }
+            
+            // 2. ゲームループの開始 (tetris.jsのGame.start()を呼び出す)
+            if (window.Game && window.Game.start) {
+                Game.start();
+            }
+            
+            // 3. ハンドトラッキングの開始
+            if (window.startHandTracking) {
+                 startHandTracking();
+            }
+
+            // UI切り替え
+            document.getElementById('start-screen').style.display = 'none';
+            document.getElementById('game-ui').style.display = 'flex';
+        };
+
+        document.getElementById('start-button').addEventListener('click', () => {
+            initializeGame(); 
+        });
+    </script>
+</body>
+</html>
