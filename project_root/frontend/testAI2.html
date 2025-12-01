@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>AI音声入力アシスタントUI (マイク/テキスト両対応版)</title>
+    <style>
+        body {
+      margin: 0;
+            background: #0f0f0f;
+            font-family: 'Segoe UI', sans-serif;
+            overflow: hidden;
+            color: #fff;
+        }
+
+             /* 1. 波形アニメーションの背景 */
+            #waveCanvas {
+                position: fixed;
+                top: 0; left: 0;
+                width: 100vw;
+                height: 100vh;
+                z-index: 0;
+            }
+
+            /* 2. UIコンテナの調整 (下部に固定) */
+            #ui {
+                position: absolute;
+                bottom: 5%;
+                left: 50%;
+                transform: translateX(-50%);
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                gap: 1.5rem;
+                z-index: 10;
+                opacity: 1; /* 初期状態を可視に */
+                transition: opacity 0.5s; /* フェードアニメーション用 */
+            }
+            
+            /* 3. ステータスエリアの定義 */
+            #status-area {
+                padding: 15px 30px;
+                background: rgba(0, 0, 0, 0.5);
+                border-radius: 12px;
+                backdrop-filter: blur(5px);
+                box-shadow: 0 0 20px rgba(0, 255, 255, 0.3);
+                color: #00ffff;
+                font-size: 1.2rem; /* サイズを調整して複数行に対応 */
+                font-weight: bold;
+                min-height: 40px; 
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                white-space: pre-line; /* 複数行表示をサポート */
+                text-align: center;
+                line-height: 1.4;
+            }
+            
+            /* 4. 入力とボタンのスタイル */
+            #input-controls {
+                display: flex;
+                gap: 1rem;
+            }
+            #messageInput {
+                width: 400px;
+                padding: 1rem;
+                font-size: 1.2rem;
+                background: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(0, 255, 255, 0.5);
+                color: #fff;
+                border-radius: 8px;
+                backdrop-filter: blur(10px);
+                outline: none;
+            }
+            #messageInput::placeholder {
+                color: rgba(255, 255, 255, 0.4);
+            }
+            /* リセットボタンのスタイルを維持 */
+            #sendBtn {
+                font-size: 1rem; 
+                text-align: center;
+                width: auto; 
+                padding: 1rem 2rem;
+                color: #0f0f0f;
+                background: #00ffff;
+                border: none;
+                border-radius: 8px;
+                cursor: pointer;
+                backdrop-filter: blur(10px);
+                transition: background 0.3s;
+                box-shadow: 0 0 40px #00ffff;
+                font-weight: bold;
+            }
+            #sendBtn:hover {
+                background: #33ffff;
+            }
+            
+            /* 5. 認識結果表示エリア (Transcript) のスタイル */
+            #transcript {
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                color: #00ffaa;
+                font-size: 2.5rem;
+                font-weight: 300;
+                text-align: center;
+                max-width: 80vw;
+                pointer-events: none; 
+                z-index: 5;
+                padding: 20px;
+                background: rgba(0, 0, 0, 0.3);
+                border-radius: 15px;
+            }
+
+            /* 6. タップ検出エリア (UIトグル用) */
+            #tapArea {
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100vw;
+                height: 100vh;
+                z-index: 1; 
+            }
+
+            /* 7. 入力欄の無効化スタイル */
+            #messageInput:disabled {
+                cursor: not-allowed;
+                background: rgba(255, 255, 255, 0.02);
+                border-color: rgba(255, 0, 0, 0.3); /* 認識中は赤っぽくして視覚的に無効と示す */
+                color: rgba(255, 255, 255, 0.3);
+            }
+        </style>
+    </head>
+    <body>
+        <canvas id="waveCanvas"></canvas>
+        
+        <div id="tapArea"></div>
+
+        <div id="transcript"></div> 
+        
+        <div id="ui">
+            <div id="status-area">
+                イマジナリーナンバー<br>
+                通称GAIイマさんAI<br>
+                AIアシスタント待機中...
+            </div>
+
+            <div id="input-controls">
+                <input type="text" id="messageInput" placeholder="ここに文章を入力するかまたは何か話してください...." value="">
+                
+                <button id="sendBtn">
+                    マイク/AIを<br>
+                    リセットする
+                </button>
+            </div>
+        </div>
+
+        <script>
+            /* ---------- Canvasアニメーション関連 ---------- */
+        const canvas = document.getElementById("waveCanvas");
+        const ctx = canvas.getContext("2d");
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+
+        let bars = [];
+        const barCount = 40;
+        const barWidth = 8;
+        const waveY = canvas.height / 2;
+        let dataArray; 
+        
+        let animationFrameId;
+        let isSpeaking = false; 
+
+        function createBars() {
+            bars = [];
+            const startX = canvas.width / 2 - (barCount * barWidth) / 2;
+            for (let i = 0; i < barCount; i++) {
+                bars.push({
+                    x: startX + i * barWidth,
+                    height: 10,
+                    color: "#00ffff"
+                });
+            }
+        }
+
+        function drawBars() {
+            bars.forEach(bar => {
+                ctx.fillStyle = bar.color;
+                ctx.fillRect(bar.x, waveY - bar.height / 2, barWidth - 2, bar.height); 
+            });
+        }
+
+ 
+        function animateBars() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // analyserとdataArrayが初期化されているか確認
+            if (isRecording && analyser && audioContext.state === 'running' && dataArray) {
+                analyser.getByteFrequencyData(dataArray);
+
+                const step = Math.floor(dataArray.length / barCount); 
+                
+                bars.forEach((bar, i) => {
+                    const volume = dataArray[i * step] / 255; 
+                    let targetHeight = volume * 180 + 20; 
+
+                    bar.height += (targetHeight - bar.height) * 0.15;
+                });
+
+            } else if (isSpeaking) {
+                // 読み上げ中のロジック
+                bars.forEach(bar => {
+                    let targetHeight = Math.random() * 80 + 20;
+                    bar.height += (targetHeight - bar.height) * 0.15;
+                });
+            } else {
+                // 待機中のロジック
+                bars.forEach(bar => {
+                    let targetHeight = 10 + Math.random() * 10;
+                    bar.height += (targetHeight - bar.height) * 0.15;
+                });
+            }
+
+            drawBars();
+            animationFrameId = requestAnimationFrame(animateBars);
+        }
+
+        // --- 2. 音声読み上げ/認識/API連携関連 ---
+        
+        // DOM要素の取得
+        const statusArea = document.getElementById("status-area");
+        const sendBtn = document.getElementById("sendBtn"); 
+        const input = document.getElementById("messageInput"); 
+        const transcriptBox = document.getElementById('transcript');
+        const ui = document.getElementById('ui'); 
+        const tapArea = document.getElementById('tapArea'); 
+        
+        // API設定
+        const API_KEY = ""; 
+        const LLM_API_URL = "http://127.0.0.1:8001/generate";
+        const MQTT_API_URL = "http://127.0.0.1:8000/control"; 
+
+        // 状態管理変数
+        const synth = window.speechSynthesis;
+        let utterance = null;
+        let currentTextToSpeak = ''; 
+        let audioContext, analyser, mediaStream;
+        let isRecording = false; 
+        let recognition = null; 
+
+        /* ---------- UI helpers ---------- */
+
+        function updateStatus(message, color = '#00ffff') {
+            statusArea.innerHTML = message; 
+            statusArea.style.color = color;
+            statusArea.style.boxShadow = `0 0 20px ${color}80`;
+        }
+
+        function setStandbyStatus() {
+            const standbyMsg = `
+            イマジナリーナンバー
+            通称GAIイマさんAI
+            AIアシスタント待機中...
+            `;
+            updateStatus(standbyMsg.trim(), '#00ffff');
+            input.disabled = false; // 待機状態に戻る際に有効化を保証
+        }
+        
+        /* ---------- Speech Recognition (Browser STT) & Audio Init ---------- */
+
+        /**
+         * Web Speech APIによる音声認識を開始します。
+         */
+        function startBrowserRecognition() {
+            if (isRecording) return;
+            
+            if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+                updateStatus('Error: Speech Recognition not supported in this browser.', '#ff0000');
+                return;
+            }
+
+            if (recognition) {
+                recognition.stop();
+                recognition = null;
+            }
+
+            recognition = new (window.webkitSpeechRecognition || window.SpeechRecognition)();
+            recognition.continuous = false; 
+            recognition.interimResults = true; 
+            recognition.lang = 'ja-JP';
+
+            recognition.onstart = () => {
+                isRecording = true;
+                isSpeaking = true; // 録音中は波形を動かす
+                input.disabled = true; // ✨ 認識開始時に入力欄を無効化
+                updateStatus('Listening...', '#ffff00');
+                transcriptBox.textContent = '話しかけてください...';
+            };
+
+            recognition.onresult = (event) => {
+                let interimTranscript = '';
+                let finalTranscript = '';
+
+                for (let i = event.resultIndex; i < event.results.length; ++i) {
+                    if (event.results[i].isFinal) {
+                        finalTranscript += event.results[i][0].transcript;
+                    } else {
+                        interimTranscript += event.results[i][0].transcript;
+                    }
+                }
+
+                // 認識結果をtranscriptBoxに表示し、入力欄にも反映
+                transcriptBox.textContent = finalTranscript || interimTranscript;
+                input.value = finalTranscript || interimTranscript; 
+            };
+
+            // 発話終了またはエラー時の自動再スタートロジック
+            const restartRecognition = () => {
+                isRecording = false;
+                input.disabled = false; // ✨ 認識再開（＝待機状態）前に入力欄を有効化
+                
+                if (!synth.speaking) {
+                    setStandbyStatus();
+                }
+                
+                setTimeout(() => {
+                    try {
+                        recognition.start();
+                    } catch (e) {
+                        if (e.name !== 'InvalidStateError') {
+                            console.warn('Recognition start failed:', e);
+                        }
+                    }
+                }, 500); 
+            };
+            
+            recognition.onend = () => {
+                isRecording = false;
+                isSpeaking = false; 
+                input.disabled = false; // ✨ 認識終了時に入力欄を有効化
+                
+                const finalPrompt = transcriptBox.textContent.trim();
+                
+                if (finalPrompt && finalPrompt.length > 1 && !finalPrompt.startsWith("イマジナリーナンバー 通称GAIイマさんAI応答:")) {
+                    updateStatus('Processing response...', '#00ffaa');
+                    
+                    // LLM処理中にSTTが自動で再起動しないように、.finallyでrestartRecognitionを呼ぶ
+                    processRecognitionResult(finalPrompt).finally(() => {
+                        input.value = ''; // 処理完了後に入力欄をクリア
+                        restartRecognition(); 
+                    });
+                } else {
+                    transcriptBox.textContent = '';
+                    input.value = '';
+                    restartRecognition();
+                }
+            };
+
+            recognition.onerror = (event) => {
+                isRecording = false;
+                isSpeaking = false;
+                input.disabled = false; // ✨ エラー発生時に入力欄を有効化
+                console.error('Speech Recognition Error:', event.error);
+                
+                if (event.error !== 'not-allowed' && event.error !== 'aborted') {
+                    restartRecognition();
+                } else if (event.error === 'aborted') {
+                    restartRecognition();
+                } else {
+                    updateStatus('Error: Microphone permission denied or failed.', '#ff0000');
+                }
+            };
+
+            try {
+                recognition.start();
+            } catch (e) {
+                console.warn('Initial recognition start failed:', e);
+            }
+        }
+
+        /**
+         * マイクアクセスを要求し、AudioContext、波形分析、およびSTTを設定する
+         */
+        async function initAudioAndSTT(){
+            if(analyser) {
+                startBrowserRecognition();
+                return;
+            }
+            updateStatus('Requesting microphone access...');
+
+            try {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = 2048;
+                
+                // dataArrayをここで初期化
+                dataArray = new Uint8Array(analyser.frequencyBinCount);
+                
+                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                const sourceNode = audioContext.createMediaStreamSource(mediaStream);
+                
+                sourceNode.connect(analyser);
+
+                startBrowserRecognition();
+
+                updateStatus('Listening...', '#ffff00');
+            } catch (e) {
+                console.error('Audio initialization failed:', e);
+                updateStatus('Error: Microphone access denied or failed to initialize.', '#ff0000');
+            }
+        }
+
+        /**
+         * FastAPI/MQTTバックエンドにコマンドを送信する関数
+         */
+        async function sendIoTCommand(command) {
+            updateStatus(`Executing IoT command: ${command}...`, '#00ffaa');
+            transcriptBox.textContent = `IoTコマンド: ${command} を実行中...`;
+            
+            try {
+                const response = await fetch(MQTT_API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ command: command })
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    const successMsg = `承知しました。${command === 'ON' ? '電気をつけました' : '電気を消しました'}。`;
+                    speak(successMsg);
+                } else {
+                    const detail = data.detail || "サーバーエラー";
+                    const errorMsg = `エラーが発生しました。IoTコマンド '${command}' の実行に失敗しました。詳細: ${detail}`;
+                    speak(errorMsg);
+                }
+            } catch (error) {
+                const networkErrorMsg = `🔴 ネットワークエラー: IoTバックエンドサーバーに接続できません (${error.message})`;
+                speak(networkErrorMsg);
+            }
+        }
+
+
+        /* ---------- 統合されたメイン処理関数 (IoT or LLM) ---------- */
+
+        async function processRecognitionResult(finalPrompt) {
+            // 1. IoTコマンドの判定と振り分け
+            const lowerPrompt = finalPrompt.toLowerCase();
+            let iotCommand = null;
+
+            if ((lowerPrompt.includes('ライト') || lowerPrompt.includes('電気')) && (lowerPrompt.includes('つけ') || lowerPrompt.includes('オン') || lowerPrompt.includes('点け'))) {
+                iotCommand = 'ON';
+            } else if ((lowerPrompt.includes('ライト') || lowerPrompt.includes('電気')) && (lowerPrompt.includes('けし') || lowerPrompt.includes('オフ') || lowerPrompt.includes('消し'))) {
+                iotCommand = 'OFF';
+            }
+
+            if (iotCommand) {
+                await sendIoTCommand(iotCommand);
+                return; 
+            }
+            
+            // 2. LLM応答生成（IoTコマンドでなかった場合）
+            await generateAndSpeakResponse(finalPrompt);
+        }
+
+
+        /* ---------- LLM (Gemini) API & TTS 連携 ---------- */
+        async function generateAndSpeakResponse(prompt) {
+            updateStatus('Generating response (via FastAPI)...', '#00ffaa');
+            
+            const cleanedPrompt = prompt.replace(/^イマジナリーナンバー 通称GAIイマさんAI応答:\s*/, '').trim();
+            if (!cleanedPrompt) {
+                return; 
+            }
+
+            const systemInstruction = "あなたは「イマジナリーナンバー 通称GAIイマさん」という名前のKS-903model8800-a1-90dという音声アシスタントです。ユーザーの質問に日本語で、簡潔かつ丁寧に答えてください。";
+
+            const payload = {
+                prompt: cleanedPrompt,
+                contents: [{ parts: [{ text: cleanedPrompt }] }],
+                systemInstruction: { parts: [{ text: systemInstruction }] },
+                tools: [{ "google_search": {} }], 
+            };
+            
+            const MAX_RETRIES = 3;
+            let responseText = "エラーが発生しました。イマジナリーナンバー 通称GAIイマさんAIのKS-903model8800-a1-90d応答を取得できませんでした。";
+
+            for (let i = 0; i < MAX_RETRIES; i++) {
+                try {
+                    const response = await fetch(LLM_API_URL, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                    
+                    if (!response.ok) {
+                        const errorData = await response.json().catch(() => ({ detail: `HTTP ${response.status} Error.` }));
+                        throw new Error(`FastAPI Error! Status: ${response.status}. Detail: ${errorData.detail}`);
+                    }
+                    
+                    const result = await response.json();
+                    
+                    if (result && result.text) {
+                        responseText = result.text;
+                        break; 
+                    } else {
+                         throw new Error("Empty response or invalid JSON structure from FastAPI.");
+                    }
+
+                } catch (e) {
+                    console.error(`FastAPI call error on attempt ${i + 1}:`, e);
+                    if (i === MAX_RETRIES - 1) {
+                        responseText = "エラーが発生しました。イマジナリーナンバー 通称GAIイマさんAIKS-903model8800-a1-90dの応答を取得できませんでした。Generaltebバックエンドサーバー (ポート8001) の実行状態とAPIキーを確認してください。";
+                    } else {
+                        const delay = 2 ** i * 1000 + Math.random() * 500;
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                    }
+                }
+            }
+
+            updateStatus('Speaking response...', '#00ffaa');
+            speak(responseText); 
+        }
+
+        /* ---------- TTS (Speech Synthesis) ---------- */
+
+        function speak(text){ 
+            if(!text) return; 
+            
+            if(synth.speaking) synth.cancel(); 
+            
+            transcriptBox.textContent = "イマジナリーナンバー 通称GAIイマさんAI応答: " + text;
+            isSpeaking = true; // 波形アニメーションを開始
+
+            const u = new SpeechSynthesisUtterance(text); 
+            u.lang='ja-JP'; 
+            u.rate=1.0; 
+            u.onstart=()=>{ 
+                const display = text.length > 20 ? text.substring(0, 20) + '...' : text;
+                const formattedStatus = `
+            イマジナリーナンバー
+            通称GAIイマさんAI応答
+            「${display}」
+            `;
+                updateStatus(formattedStatus.trim(), '#00ffaa');
+            }; 
+            u.onend=()=>{ 
+                isSpeaking = false; // 波形アニメーションを停止
+                // 読み上げ終了後、STTが自動で再スタートするため、ここでは待機状態に戻さない (STTのonendに任せる)
+                // ステータス表示の更新のみ行う (待機状態に戻ることを示唆)
+                const formattedStatus = (
+                    "  イマジナリーナンバー   <br>" +
+                    "  通称GAIイマさん  AI <br>" +
+                    "アシスタント待機中..."
+                );
+
+                updateStatus(formattedStatus);
+            }; 
+            u.onerror = (e) => {
+                console.error('TTS error:', e);
+                isSpeaking = false;
+                setStandbyStatus();
+            };
+
+            synth.speak(u); 
+        }
+
+        /* ---------- イベントハンドラの統合と定義 ---------- */
+
+        // 【✨テキスト入力のイベントハンドラ】
+        input.addEventListener('keypress', (event) => {
+            // ユーザーがEnterキーを押したことを検出
+            if (event.key === 'Enter') {
+                const textPrompt = input.value.trim();
+                if (textPrompt) {
+                    // マイク入力を一時停止 (衝突防止)
+                    if (recognition && isRecording) {
+                        recognition.stop(); // STTを強制終了
+                        isRecording = false;
+                    }
+                    
+                    updateStatus('Text input received. Processing...', '#ffff00');
+                    transcriptBox.textContent = '入力されたテキストを処理中...';
+                    
+                    // LLM/IoT処理を実行
+                    processRecognitionResult(textPrompt).finally(() => {
+                        // 処理が終わったら、テキスト入力欄をクリア
+                        input.value = '';
+                        // 音声認識を再開
+                        setTimeout(startBrowserRecognition, 1000);
+                    });
+                }
+            }
+        });
+
+
+        // リセットボタンの機能 (STTとTTSの強制停止と再起動)
+        sendBtn.addEventListener("click", () => {
+            if (recognition) {
+                recognition.stop();
+                recognition = null;
+            }
+            if(synth.speaking) synth.cancel(); 
+
+            transcriptBox.textContent='リセット中...'; 
+            input.value = ''; // リセット時に入力欄もクリア
+            input.disabled = false; // ✨ リセット時に入力欄を有効化
+            
+            initAudioAndSTT();
+            updateStatus('リセットしました。マイク入力を開始しています...'); 
+        });
+
+
+        // UI トグル機能 (画面タップ) の修正
+        let uiVisible = true; // 初期状態を可視に変更
+        tapArea.addEventListener('click', (e) => {
+            // リセットボタン/入力欄へのタップは無視
+            if (e.target.closest('#input-controls')) {
+                return;
+            }
+
+            uiVisible = !uiVisible;
+            if (uiVisible) {
+                ui.style.opacity = 1; 
+            } else {
+                ui.style.opacity = 0; 
+            }
+        });
+
+        /* ---------- Start-up ---------- */
+        window.onload = function() {
+            createBars();
+            animateBars();
+            initAudioAndSTT(); // マイク初期化とSTTを自動で開始
+            setStandbyStatus();
+            input.focus(); // 起動時に入力欄にフォーカス
+        }
+    </script>
+</body>
+</html>

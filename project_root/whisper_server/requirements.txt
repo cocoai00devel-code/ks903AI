@@ -1,0 +1,6 @@
+
+websockets 
+openai-whisper 
+torch
+numpy 
+# transformers (必要に応じて)

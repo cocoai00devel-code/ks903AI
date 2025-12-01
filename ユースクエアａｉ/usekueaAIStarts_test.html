@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gemini AI Assistant UI (テスト)</title>
+    <!-- Tailwind CSSの読み込み -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* カスタムスタイル: インターフォントを適用 */
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7f9fc;
+        }
+        /* スピナーのためのCSS */
+        .spinner {
+            border: 4px solid rgba(255, 255, 255, 0.3);
+            border-top: 4px solid #10b981; /* エメラルドグリーン */
+            border-radius: 50%;
+            width: 24px;
+            height: 24px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="p-4 md:p-8 min-h-screen flex items-start justify-center">
+
+    <div class="w-full max-w-2xl bg-white p-6 md:p-8 rounded-xl shadow-2xl border border-gray-100">
+        <h1 class="text-3xl font-bold text-gray-800 mb-2 flex items-center">
+            <svg class="w-8 h-8 mr-2 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M16 12h1m-1.636 4.364l.707.707M4 12H3m1.636 4.364L3.929 17.707M19.791 7.379l-1.414 1.414M4.929 7.379l1.414 1.414M12 18h.01"></path></svg>
+            AIアシスタント・テスター
+        </h1>
+        <p class="text-gray-500 mb-6">バックエンドのFastAPIサーバーに接続し、Geminiモデルからの応答を確認します。</p>
+
+        <!-- 入力エリア -->
+        <div class="mb-6">
+            <label for="prompt" class="block text-sm font-medium text-gray-700 mb-2">プロンプトを入力してください:</label>
+            <textarea id="prompt" rows="4" class="w-full p-3 border border-gray-300 rounded-lg focus:ring-emerald-500 focus:border-emerald-500 transition duration-150 shadow-sm" placeholder="例: 人工知能ユースクエアAI - 音声アシスタントとして自己紹介してください。" required></textarea>
+        </div>
+
+        <!-- 応答トークン設定 -->
+        <div class="mb-6 flex items-center space-x-4">
+            <label for="max_length" class="text-sm font-medium text-gray-700">最大応答トークン:</label>
+            <input type="number" id="max_length" value="1000" min="100" max="4096" class="p-2 border border-gray-300 rounded-lg w-24 text-center shadow-sm">
+        </div>
+
+        <!-- 送信ボタン -->
+        <button id="submitButton" class="w-full py-3 px-4 bg-emerald-600 text-white font-semibold rounded-lg hover:bg-emerald-700 transition duration-200 focus:outline-none focus:ring-4 focus:ring-emerald-500 focus:ring-opacity-50 flex items-center justify-center shadow-md" onclick="generateResponse()">
+            <span id="buttonText">AI応答を生成</span>
+            <div id="loadingSpinner" class="spinner ml-3 hidden"></div>
+        </button>
+
+        <!-- 応答表示エリア -->
+        <div class="mt-8">
+            <h2 class="text-xl font-semibold text-gray-800 mb-3 border-b pb-1">AI応答</h2>
+            <div id="responseContainer" class="p-4 bg-gray-50 border border-gray-200 rounded-lg min-h-[100px] whitespace-pre-wrap shadow-inner text-gray-700 leading-relaxed">
+                ここにAIからの応答が表示されます。
+            </div>
+            <p id="statusMessage" class="mt-4 text-sm text-center font-medium"></p>
+        </div>
+    </div>
+
+    <script>
+        // バックエンドのURL。Canvas環境では、ルート（/）がFastAPIサーバーにマッピングされます。
+        const API_URL = "/llm/generate";
+        
+        const button = document.getElementById('submitButton');
+        const buttonText = document.getElementById('buttonText');
+        const spinner = document.getElementById('loadingSpinner');
+        const responseContainer = document.getElementById('responseContainer');
+        const statusMessage = document.getElementById('statusMessage');
+
+        /**
+         * Exponential backoffを使用したフェッチ関数
+         * @param {string} url - API URL
+         * @param {object} options - fetchオプション
+         * @param {number} retries - 最大リトライ回数
+         * @returns {Promise<Response>} fetch応答
+         */
+        async function fetchWithBackoff(url, options, retries = 5) {
+            for (let i = 0; i < retries; i++) {
+                try {
+                    const response = await fetch(url, options);
+                    if (response.status !== 503 && response.status !== 429) {
+                        return response; // 成功または永続的なエラー
+                    }
+                    // 503/429エラーの場合、リトライ
+                    throw new Error(`Transient error: ${response.status}`);
+                } catch (error) {
+                    if (i === retries - 1) {
+                        throw error; // 最終リトライで失敗
+                    }
+                    // Exponential backoff
+                    const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+        }
+
+
+        async function generateResponse() {
+            const prompt = document.getElementById('prompt').value.trim();
+            const maxLength = parseInt(document.getElementById('max_length').value, 10);
+
+            if (!prompt) {
+                statusMessage.textContent = "🔴 エラー: プロンプトを入力してください。";
+                statusMessage.className = 'mt-4 text-sm text-center font-medium text-red-600';
+                return;
+            }
+
+            // UI状態をロード中に設定
+            button.disabled = true;
+            buttonText.textContent = "生成中...";
+            spinner.classList.remove('hidden');
+            responseContainer.textContent = "AI応答を待機しています...";
+            statusMessage.textContent = "";
+            statusMessage.className = 'mt-4 text-sm text-center font-medium';
+
+
+            try {
+                const payload = {
+                    prompt: prompt,
+                    max_length: maxLength
+                };
+
+                const response = await fetchWithBackoff(API_URL, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(payload)
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    // 成功応答
+                    responseContainer.textContent = data.text;
+                    statusMessage.textContent = "✅ 応答が正常に生成されました！";
+                    statusMessage.className = 'mt-4 text-sm text-center font-medium text-emerald-600';
+                } else {
+                    // APIからのエラー応答 (例: 500, APIキー不足)
+                    const errorDetail = data.detail || "詳細不明のエラーです。サーバーログを確認してください。";
+                    responseContainer.textContent = `エラーが発生しました。\n詳細: ${errorDetail}`;
+                    statusMessage.textContent = "🔴 サーバーエラー: AI応答の生成に失敗しました。";
+                    statusMessage.className = 'mt-4 text-sm text-center font-medium text-red-600';
+                }
+
+            } catch (error) {
+                // ネットワークエラーやフェッチのエラー
+                responseContainer.textContent = `接続エラーが発生しました。バックエンドが実行中か、CORS設定が正しいか確認してください。`;
+                statusMessage.textContent = "❌ ネットワークまたは内部エラー。";
+                statusMessage.className = 'mt-4 text-sm text-center font-medium text-red-600';
+            } finally {
+                // UI状態をリセット
+                button.disabled = false;
+                buttonText.textContent = "AI応答を生成";
+                spinner.classList.add('hidden');
+            }
+        }
+
+        // 初期ヘルスチェック（オプション）
+        window.onload = async () => {
+            try {
+                const response = await fetch('/');
+                const data = await response.json();
+                if (data.status === 'ok') {
+                    const clientStatus = data.client_status === 'Ready' ? '接続準備完了' : 'APIキーエラー';
+                    statusMessage.textContent = `サーバー状態: OK (${clientStatus})`;
+                    statusMessage.className = 'mt-4 text-sm text-center font-medium ' + (data.client_status === 'Ready' ? 'text-emerald-600' : 'text-orange-500');
+                } else {
+                    statusMessage.textContent = `サーバー状態: 起動中ですが、ルートエンドポイントが異常です。`;
+                    statusMessage.className = 'mt-4 text-sm text-center font-medium text-orange-500';
+                }
+            } catch (e) {
+                statusMessage.textContent = `サーバー状態: 接続できません。デプロイを確認してください。`;
+                statusMessage.className = 'mt-4 text-sm text-center font-medium text-red-600';
+            }
+        }
+    </script>
+</body>
+</html>

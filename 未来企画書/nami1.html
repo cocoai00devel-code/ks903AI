@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Hybrid AI Voice Assistant (自動連続認識 + VAD)</title>
+<style>
+    :root{--accent:#00ffff;--accent-2:#00ffaa;--bg:#0f0f0f}
+    html,body{height:100%;margin:0;background:var(--bg);color:#fff;font-family:Segoe UI,system-ui,Arial}
+    canvas{position:fixed;inset:0;z-index:0}
+    
+    /* 💡 UIのフェードイン/アウトとタップ領域のスタイル */
+    #ui{
+        position:absolute;left:50%;bottom:5%;transform:translateX(-50%);z-index:10;width:min(980px,94vw);
+        opacity: 1; /* 初期表示 */
+        transition: opacity 0.5s ease-in-out; /* アニメーション設定 */
+    }
+    /* 画面全体をタップ領域として設定 */
+    #tapArea {
+        position: fixed;
+        inset: 0;
+        z-index: 5; /* UIの下、キャンバスの上に配置 */
+    }
+
+    #status-area{padding:14px 20px;border-radius:12px;background:rgba(0,0,0,0.45);box-shadow:0 0 20px #00ffff55;color:var(--accent);font-weight:700}
+    #controls{display:flex;gap:12px;margin-top:10px;align-items:center}
+    #messageInput{flex:1;padding:12px 14px;border-radius:10px;border:1px solid rgba(0,255,255,0.15);background:rgba(255,255,255,0.03);color:#fff;font-size:16px}
+    button{padding:10px 14px;border-radius:10px;border:none;cursor:pointer;font-weight:700}
+    #micBtn{background:var(--accent-2);color:#000} /* このボタンは機能的には使わないが、CSSは残す */
+    #resetBtn{background:var(--accent);color:#000}
+    #modeIndicator{padding:8px 10px;border-radius:8px;background:#00000044;font-size:0.9rem}
+    #subtext{margin-top:8px;color:#bfeeff}
+    .active{box-shadow:0 0 20px #ff5555}
+    #transcript{margin-top:12px;padding:12px;border-radius:10px;background:rgba(255,255,255,0.02);min-height:48px;font-size:16px}
+</style>
+</head>
+<body>
+<canvas id="waveCanvas"></canvas>
+
+<div id="tapArea"></div>
+
+<div id="ui">
+    <div id="status-area">Initializing...</div>
+    <div id="controls">
+        <input id="messageInput" placeholder="話しかけてください..." disabled> <button id="resetBtn">リセット</button>
+        <div id="modeIndicator">--</div>
+    </div>
+    <div id="subtext">連続認識モード（VADによる自動スタート/ストップ）</div>
+    <div id="transcript"></div>
+</div><script>
+/* ---------- Config ---------- */
+const WHISPER_WS_URL = 'ws://localhost:8765'; // change if server is remote
+const VAD_SILENCE_MS = 1500; // 💡 サイレンス判定時間 (長めに設定し、自動ストップの役割を持たせる)
+const AUDIO_CHUNK_MS = 300; // chunk length sent to server (ms)
+const ENABLE_FALLBACK = true; // use browser SpeechRecognition if server unreachable
+
+/* ---------- DOM ---------- */
+const statusArea = document.getElementById('status-area');
+const resetBtn = document.getElementById('resetBtn');
+const input = document.getElementById('messageInput');
+const modeIndicator = document.getElementById('modeIndicator');
+const transcriptBox = document.getElementById('transcript');
+const ui = document.getElementById('ui'); // UIコンテナ
+const tapArea = document.getElementById('tapArea'); // タップ領域
+
+/* ---------- Audio / Waveform ---------- */
+const canvas = document.getElementById('waveCanvas');
+const ctx = canvas.getContext('2d');
+function resizeCanvas(){canvas.width = innerWidth; canvas.height = innerHeight}
+window.addEventListener('resize', resizeCanvas); resizeCanvas();
+
+let audioContext, analyser, mediaStream, sourceNode, processorNode;
+let isRecording = false;
+let ws=null, wsAvailable=false;
+let useServer=false;
+let recognition=null; // browser fallback
+
+/* VAD helper */
+let lastSpokenTime = 0;
+let vadSilenceTimer = null;
+function nowMs(){return performance.now()}
+
+/* Simple energy VAD */
+function isLoud(buffer, threshold=0.01){
+    let sum=0; for(let i=0;i<buffer.length;i++){ let v=buffer[i]; sum += v*v }
+    let rms = Math.sqrt(sum / buffer.length);
+    return rms > threshold;
+}
+
+/* Waveform draw */
+let waveformData = new Float32Array(1024);
+// Waveformの描画ロジックはinit()内のloopCanvas()に移譲され、分析データに基づいて動的に変化する
+
+/* ---------- WebSocket (Whisper) client ---------- */
+function connectWS(){
+    status('Connecting to Whisper server...');
+    ws = new WebSocket(WHISPER_WS_URL);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = ()=>{ wsAvailable=true; status('Whisper server connected'); modeIndicator.textContent='mode: server (Whisper)'; useServer=true };
+    ws.onmessage = (ev)=>{
+        // assume text messages are partial/final transcripts
+        const text = typeof ev.data === 'string' ? ev.data : new TextDecoder().decode(ev.data);
+        // server may send JSON: {type:'partial'|'final', text:'...'}
+        try{
+            const j = JSON.parse(text);
+            if(j.type === 'partial'){
+                input.value = j.text; transcriptBox.textContent = j.text;
+            } else if(j.type==='final'){
+                input.value = j.text; transcriptBox.textContent = j.text; speak(j.text);
+            } else {
+                input.value = j.text; transcriptBox.textContent = j.text;
+            }
+        }catch(e){
+            // plain text fallback
+            input.value = text; transcriptBox.textContent = text; speak(text);
+        }
+    };
+    ws.onerror = (e)=>{ console.warn('ws err',e); wsAvailable=false; useServer=false; if(ENABLE_FALLBACK) status('Whisper server unreachable. Will use browser STT fallback'); };
+    ws.onclose = ()=>{ wsAvailable=false; useServer=false; /* stopRecording(); */ status('Whisper server closed'); modeIndicator.textContent='mode: fallback'; };
+}
+
+/* ---------- Audio capture & streaming (修正: VADによる自動コミットとリスタート) ---------- */
+async function startRecording(){
+    if(isRecording) return;
+    isRecording = true; 
+    
+    try{
+        mediaStream = await navigator.mediaDevices.getUserMedia({audio:true});
+    }catch(err){ status('マイクの取得に失敗しました'); console.error(err); return }
+
+    audioContext = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 16000});
+    sourceNode = audioContext.createMediaStreamSource(mediaStream);
+    analyser = audioContext.createAnalyser(); analyser.fftSize = 2048;
+    sourceNode.connect(analyser);
+    processorNode = audioContext.createScriptProcessor(4096,1,1);
+    sourceNode.connect(processorNode); processorNode.connect(audioContext.destination);
+
+    const bufferQueue = [];
+    let chunkMillis = AUDIO_CHUNK_MS;
+    let sampleRate = audioContext.sampleRate;
+    let samplesPerChunk = Math.floor(sampleRate * (chunkMillis/1000));
+
+    // 💡 録音開始時のステータス更新 (自動認識モード)
+    status(useServer ? 'Listening (Whisper Server)...' : 'Listening (Browser STT)...');
+    lastSpokenTime = nowMs(); // タイマーリセット
+
+    processorNode.onaudioprocess = (evt)=>{
+        const chData = evt.inputBuffer.getChannelData(0);
+        const chunk = new Float32Array(chData.length); chunk.set(chData);
+        bufferQueue.push(chunk);
+
+        if(isLoud(chData)){
+            lastSpokenTime = nowMs();
+        }
+
+        let totalSamples = bufferQueue.reduce((a,b)=>a+b.length,0);
+        if(totalSamples >= samplesPerChunk){
+            const out = new Float32Array(samplesPerChunk);
+            let offset=0;
+            while(offset < samplesPerChunk){
+                const piece = bufferQueue.shift();
+                const needed = Math.min(piece.length, samplesPerChunk - offset);
+                out.set(piece.subarray(0,needed), offset);
+                if(needed < piece.length){
+                    bufferQueue.unshift(piece.subarray(needed));
+                }
+                offset += needed;
+            }
+
+            if(useServer && ws && ws.readyState===1){
+                // send audio chunk to Whisper server
+                const pcm16 = floatTo16BitPCM(out);
+                ws.send(pcm16.buffer);
+            }
+            
+            // 💡 VADによるサイレンス検出とコミット/リスタート
+            if(nowMs() - lastSpokenTime > VAD_SILENCE_MS){
+                if(useServer && ws && ws.readyState===1){ 
+                    try{ ws.send(JSON.stringify({type:'commit'})) }catch(e){} // サーバーに終了を通知
+                }
+                
+                // ブラウザ認識の場合は連続モードなので、ここでは特に何もしない（onendを待つ）
+                // 💡 連続認識モードでは、音声の区切りごとに内容を確定させ、録音を再開する（または継続させる）のが理想
+                // ここでは簡単化のため、VADでサイレンスが検出されても録音自体は止めず、サーバーにコミット信号を送るのみとします。
+                lastSpokenTime = nowMs(); // タイマーリセット
+                
+                // 💡 サイレンス時のUIフィードバック
+                status(useServer ? 'Listening (Whisper Server): Silence' : 'Listening (Browser STT): Silence');
+            } else {
+                 status(useServer ? 'Listening (Whisper Server): Speaking' : 'Listening (Browser STT): Speaking');
+            }
+        }
+    };
+
+    // start fallback SpeechRecognition if needed and server unavailable
+    if(ENABLE_FALLBACK && !useServer) startBrowserRecognition();
+}
+
+function stopRecording(){
+    if(!isRecording) return;
+    isRecording=false; 
+    try{ processorNode && processorNode.disconnect(); sourceNode && sourceNode.disconnect(); analyser && (analyser.disconnect && analyser.disconnect()); }
+    catch(e){}
+    mediaStream && mediaStream.getTracks().forEach(t=>t.stop());
+    audioContext && audioContext.close(); audioContext=null; analyser=null; processorNode=null; sourceNode=null;
+    status('Stopped');
+    stopBrowserRecognition();
+}
+
+function floatTo16BitPCM(float32Array){
+    const l = float32Array.length; const buf = new ArrayBuffer(l*2); const view = new DataView(buf);
+    let offset=0; for(let i=0;i<l;i++){ let s=Math.max(-1,Math.min(1,float32Array[i])); view.setInt16(offset, s<0? s*0x8000 : s*0x7FFF, true); offset+=2 }
+    return new Int16Array(buf);
+}
+
+/* ---------- Browser SpeechRecognition fallback ---------- */
+function startBrowserRecognition(){
+    if(!('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)){
+        status('ブラウザ音声認識が未対応です'); return; }
+    const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+    recognition = new SpeechRec(); recognition.lang='ja-JP'; recognition.interimResults=true; recognition.continuous=true;
+    recognition.onstart = ()=>{ status('Listening (Browser STT)...'); modeIndicator.textContent='mode: browser STT'; }
+    recognition.onresult = (ev)=>{
+        let interim=''; let final='';
+        for(let i=0;i<ev.results.length;i++){ const t=ev.results[i][0].transcript; ev.results[i].isFinal? final+=t: interim+=t }
+        input.value = final || interim; transcriptBox.textContent = input.value;
+        if(final) speak(final);
+    };
+    recognition.onerror = (e)=>{ console.warn('recog err',e); };
+    recognition.onend = ()=>{ /* recognition.start(); // continuous=trueで自動再開するはず */ };
+    recognition.start();
+}
+function stopBrowserRecognition(){ if(recognition){ try{ recognition.stop() }catch(e){} recognition=null } }
+
+/* ---------- TTS ---------- */
+const synth = window.speechSynthesis;
+let lastSpokenText = '';
+function speak(text){ 
+    if(!text || text===lastSpokenText) return; 
+    lastSpokenText = text; 
+    if(synth.speaking) synth.cancel(); 
+    const u = new SpeechSynthesisUtterance(text); 
+    u.lang='ja-JP'; 
+    u.rate=1.0; 
+    u.onstart=()=>{ status('Speaking...'); }; 
+    u.onend=()=>{ status('Listening...'); }; // 読み上げ終了後、リスニング状態に戻る
+    synth.speak(u); 
+}
+
+/* ---------- UI helpers ---------- */
+function status(msg){ statusArea.textContent = msg }
+
+/* ---------- UI トグル機能 (画面タップ) ---------- */
+let uiVisible = true;
+tapArea.addEventListener('click', (e) => {
+    // 記入欄やリセットボタンへのタップは無視する
+    if (e.target.closest('#controls') || e.target.closest('#transcript')) {
+        return;
+    }
+
+    uiVisible = !uiVisible;
+    if (uiVisible) {
+        ui.style.opacity = 1; // フェードイン
+    } else {
+        ui.style.opacity = 0; // フェードアウト
+    }
+});
+
+
+/* ---------- Controls ---------- */
+resetBtn.addEventListener('click', ()=>{ 
+    input.value=''; transcriptBox.textContent=''; 
+    if(synth.speaking) synth.cancel(); 
+    lastSpokenText = '';
+    status('Reset'); 
+});
+
+
+/* ---------- Start-up ---------- */
+(function init(){
+    // 1. WebSocket接続チェックとモード設定
+    status('Initializing audio...');
+    new Promise(resolve => {
+        try{ 
+            const p = new WebSocket(WHISPER_WS_URL); 
+            p.onopen=()=>{ 
+                p.close(); 
+                wsAvailable = true;
+                useServer = true;
+                status('Whisper server reachable'); 
+                modeIndicator.textContent='mode: server (available)'; 
+                resolve();
+            }; 
+            p.onerror=()=>{ 
+                wsAvailable = false;
+                useServer = false;
+                modeIndicator.textContent='mode: fallback (no server)'; 
+                status('Whisper server not reachable - will use browser STT'); 
+                resolve();
+            }; 
+        } catch(e){ 
+            wsAvailable = false;
+            useServer = false;
+            modeIndicator.textContent='mode: fallback'; 
+            status('ready'); 
+            resolve();
+        }
+    }).then(() => {
+        // 2. 起動時に自動で認識を開始
+        startRecording();
+    });
+
+    // 3. Waveformの視覚ループ
+    (function loopCanvas(){
+        if(analyser){
+            const bufferLen = analyser.fftSize; const data = new Float32Array(bufferLen);
+            analyser.getFloatTimeDomainData(data);
+            ctx.clearRect(0,0,canvas.width,canvas.height);
+            ctx.beginPath();
+            const mid = canvas.height*0.55; const step = canvas.width / bufferLen;
+            for(let i=0;i<bufferLen;i++){ 
+                // 💡 波形をよりダイナミックに
+                const amp = isRecording ? 0.9 : 0.4;
+                const y=mid + data[i]*mid*amp; 
+                if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y) 
+            }
+            ctx.strokeStyle='rgba(0,230,255,0.9)'; ctx.lineWidth=2; ctx.stroke();
+        }
+        requestAnimationFrame(loopCanvas);
+    })();
+})();
+
+</script></body>
+</html>
