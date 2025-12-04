@@ -1,0 +1,8 @@
+openai-whisper
+gradio
+numpy
+torch # Whisperの実行エンジン
+fastapi
+uvicorn
+pydantic
+google-genai

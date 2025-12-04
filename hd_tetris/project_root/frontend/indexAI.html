@@ -1,0 +1,916 @@
+
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>イマジンさん AI　ブチュブチュマンまたはぶつぶつマン Voice Assistant (自動連続認識 + VAD)</title>
+<style>
+/* CSS部分は変更なし */
+    :root{--accent:#00ffff;--accent-2:#00ffaa;--bg:#0f0f0f}
+    html,body{height:100%;margin:0;background:var(--bg);color:#fff;font-family:Segoe UI,system-ui,Arial}
+    canvas{position:fixed;inset:0;z-index:0}
+    
+    /* 💡 UIのフェードイン/アウトとタップ領域のスタイル */
+    #ui{
+        position:absolute;left:50%;bottom:5%;transform:translateX(-50%);z-index:10;width:min(980px,94vw);
+        opacity: 1; /* 初期表示 */
+        transition: opacity 0.5s ease-in-out; /* アニメーション設定 */
+    }
+    /* 画面全体をタップ領域として設定 */
+    #tapArea {
+        position: fixed;
+        inset: 0;
+        z-index: 5; /* UIの下、キャンバスの上に配置 */
+    }
+
+    #status-area{padding:14px 20px;border-radius:12px;background:rgba(0,0,0,0.45);box-shadow:0 0 20px #00ffff55;color:var(--accent);font-weight:700}
+    #controls{display:flex;gap:12px;margin-top:10px;align-items:center}
+    #messageInput{flex:1;padding:12px 14px;border-radius:10px;border:1px solid rgba(0,255,255,0.15);background:rgba(255,255,255,0.03);color:#fff;font-size:16px}
+    button{padding:10px 14px;border-radius:10px;border:none;cursor:pointer;font-weight:700}
+    #micBtn{background:var(--accent-2);color:#000} /* このボタンは機能的には使わないが、CSSは残す */
+    #resetBtn{background:var(--accent);color:#000}
+    #modeIndicator{padding:8px 10px;border-radius:8px;background:#00000044;font-size:0.9rem}
+    #subtext{margin-top:8px;color:#bfeeff}
+    .active{box-shadow:0 0 20px #ff5555}
+    #transcript{margin-top:12px;padding:12px;border-radius:10px;background:rgba(255,255,255,0.02);min-height:48px;font-size:16px}
+</style>
+</head>
+<body>
+<canvas id="waveCanvas"></canvas>
+
+<div id="tapArea"></div>
+
+<div id="ui">
+    <div id="status-area">Initializing...</div>
+    <div id="controls">
+        <input id="messageInput" placeholder="話しかけてください..." disabled> <button id="resetBtn">リセット</button>
+        <div id="modeIndicator">STT/LLM/IoT</div>
+    </div>
+    <div id="subtext">連続認識モード（VADによる自動スタート/ストップ）</div>
+    <div id="transcript"></div>
+</div><script>
+// Canvas環境では自動でAPIキーが設定されます
+const API_KEY = ""; 
+const GEMINI_MODEL = 'gemini-2.5-flash-preview-09-2025';
+// 💡 MQTT FastAPI バックエンドのURL (mqtt_fastapi_backend.py がポート8000で動作)
+const MQTT_API_URL = "http://127.0.0.1:8000/control"; 
+
+/* ---------- DOM ---------- */
+const statusArea = document.getElementById('status-area');
+const resetBtn = document.getElementById('resetBtn');
+const input = document.getElementById('messageInput');
+const modeIndicator = document.getElementById('modeIndicator');
+const transcriptBox = document.getElementById('transcript');
+const ui = document.getElementById('ui'); 
+const tapArea = document.getElementById('tapArea'); 
+
+/* ---------- Audio / Waveform ---------- */
+const canvas = document.getElementById('waveCanvas');
+const ctx = canvas.getContext('2d');
+function resizeCanvas(){canvas.width = innerWidth; canvas.height = innerHeight}
+window.addEventListener('resize', resizeCanvas); resizeCanvas();
+
+let audioContext, analyser, mediaStream;
+let isRecording = false; // 音声認識がアクティブかどうか
+let recognition = null; // Web Speech API SpeechRecognition Object
+
+/* ---------- UI helpers ---------- */
+function status(msg){ statusArea.textContent = msg }
+
+/* ---------- Speech Recognition (Browser STT) & Audio Init ---------- */
+
+/**
+ * Web Speech APIによる音声認識を開始します。
+ * この関数は、マイクアクセスが成功し、audioContextが準備できてから呼び出されます。
+ */
+function startBrowserRecognition() {
+    // 既に実行中の場合は何もしない
+    if (isRecording) return;
+    
+    if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+        status('Error: Speech Recognition not supported in this browser.');
+        return;
+    }
+
+    // 既存の認識インスタンスをクリア
+    if (recognition) {
+        recognition.stop();
+        recognition = null;
+    }
+
+    recognition = new (window.webkitSpeechRecognition || window.SpeechRecognition)();
+
+    // 連続認識モード (発話の切れ目で自動停止)
+    recognition.continuous = false; 
+    recognition.interimResults = true; 
+    recognition.lang = 'ja-JP';
+
+    recognition.onstart = () => {
+        isRecording = true;
+        status('Listening...');
+        input.value = '話しています...';
+    };
+
+    recognition.onresult = (event) => {
+        let interimTranscript = '';
+        let finalTranscript = '';
+
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+            if (event.results[i].isFinal) {
+                finalTranscript += event.results[i][0].transcript;
+            } else {
+                interimTranscript += event.results[i][0].transcript;
+            }
+        }
+
+        transcriptBox.textContent = finalTranscript || interimTranscript;
+        input.value = finalTranscript || interimTranscript;
+    };
+
+    // 💡 発話終了またはエラー時の自動再スタートロジック
+    const restartRecognition = () => {
+        status('Recognition stopped. Restarting...');
+        setTimeout(() => {
+            try {
+                recognition.start();
+            } catch (e) {
+                // 既に実行中の場合のエラーを無視
+                if (e.name !== 'InvalidStateError') {
+                    console.warn('Recognition start failed:', e);
+                }
+            }
+        }, 500); 
+    };
+    
+    recognition.onend = () => {
+        isRecording = false;
+        
+        const finalPrompt = transcriptBox.textContent.trim();
+        
+        if (finalPrompt && finalPrompt.length > 1 && !finalPrompt.startsWith("AI応答:")) { // 短すぎる発話やAI応答テキストを無視
+            status('Processing response...');
+            processRecognitionResult(finalPrompt).finally(() => {
+                restartRecognition(); // 処理後に再スタート
+            });
+        } else {
+            // 認識結果がない場合は即座に再スタート
+            transcriptBox.textContent = '';
+            input.value = '話しかけてください...';
+            restartRecognition();
+        }
+    };
+
+    recognition.onerror = (event) => {
+        isRecording = false;
+        console.error('Speech Recognition Error:', event.error);
+        
+        // 🚨 修正箇所: aborted, no-speech, network, audio-capture の場合は再スタートを試みる
+        if (event.error === 'aborted' || event.error === 'no-speech' || event.error === 'network' || event.error === 'audio-capture') {
+            transcriptBox.textContent = '';
+            input.value = '話しかけてください...';
+            restartRecognition();
+        } else {
+            // その他の致命的なエラー（例：not-allowedなど）
+            status(`Error: ${event.error}. Please check microphone settings.`);
+        }
+    };
+
+    // 最初のスタート
+    try {
+        recognition.start();
+    } catch (e) {
+        console.warn('Initial recognition start failed:', e);
+    }
+}
+
+/**
+ * マイクアクセスを要求し、AudioContext、波形分析、およびSTTを設定する
+ */
+async function initAudioAndSTT(){
+    // 既に初期化済みの場合はSTTだけ再スタート
+    if(analyser) {
+        startBrowserRecognition();
+        return;
+    }
+    status('Requesting microphone access...');
+
+    try {
+        // 1. AudioContextの初期化
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        analyser = audioContext.createAnalyser();
+        analyser.fftSize = 2048;
+        
+        // 2. マイクへのアクセス
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const sourceNode = audioContext.createMediaStreamSource(mediaStream);
+        
+        // 3. 接続（ソース -> アナライザ）
+        sourceNode.connect(analyser);
+
+        // 4. ブラウザSTTの開始
+        startBrowserRecognition();
+
+        status('Listening...');
+    } catch (e) {
+        console.error('Audio initialization failed:', e);
+        status('Error: Microphone access denied or failed to initialize.');
+    }
+}
+
+/**
+ * 💡 FastAPI/MQTTバックエンドにコマンドを送信する関数
+ */
+async function sendIoTCommand(command) {
+    status(`Executing IoT command: ${command}...`);
+    transcriptBox.textContent = `IoTコマンド: ${command} を実行中...`;
+    
+    try {
+        const response = await fetch(MQTT_API_URL, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ command: command })
+        });
+
+        const data = await response.json();
+
+        if (response.ok) {
+            // 成功
+            const successMsg = `承知しました。${command === 'ON' ? '電気をつけました' : '電気を消しました'}。`;
+            console.log("IoT Success:", data);
+            speak(successMsg);
+        } else {
+            // 失敗 (HTTP 4xx/5xx エラー)
+            const detail = data.detail || "サーバーエラー";
+            const errorMsg = `エラーが発生しました。IoTコマンド '${command}' の実行に失敗しました。詳細: ${detail}`;
+            console.error("IoT Error:", data);
+            speak(errorMsg);
+        }
+    } catch (error) {
+        // ネットワークエラーなど
+        const networkErrorMsg = `🔴 ネットワークエラー: IoTバックエンドサーバーに接続できません (${error.message})`;
+        console.error("IoT Network Error:", error);
+        speak(networkErrorMsg);
+    }
+}
+
+
+/* ---------- 統合されたメイン処理関数 (IoT or LLM) ---------- */
+
+async function processRecognitionResult(finalPrompt) {
+    // 1. IoTコマンドの判定と振り分け
+    const lowerPrompt = finalPrompt.toLowerCase();
+    let iotCommand = null;
+
+    if ((lowerPrompt.includes('ライト') || lowerPrompt.includes('電気')) && (lowerPrompt.includes('つけ') || lowerPrompt.includes('オン') || lowerPrompt.includes('点け'))) {
+        iotCommand = 'ON';
+    } else if ((lowerPrompt.includes('ライト') || lowerPrompt.includes('電気')) && (lowerPrompt.includes('けし') || lowerPrompt.includes('オフ') || lowerPrompt.includes('消し'))) {
+        iotCommand = 'OFF';
+    }
+
+    if (iotCommand) {
+        // 💡 修正: ダミーではなく、実際のIoTコマンド送信関数を呼び出す
+        await sendIoTCommand(iotCommand);
+        return; 
+    }
+    
+    // 2. LLM応答生成（IoTコマンドでなかった場合）
+    await generateAndSpeakResponse(finalPrompt);
+}
+
+
+/* ---------- LLM (Gemini) API & TTS 連携 ---------- */
+async function generateAndSpeakResponse(prompt) {
+    status('Generating response (Gemini)...');
+    
+    // ユーザーが「AI応答:」というテキストを話した場合、それを除外する
+    const cleanedPrompt = prompt.replace(/^AI応答:\s*/, '').trim();
+    if (!cleanedPrompt) {
+        return; 
+    }
+
+    const systemInstruction = "あなたは「イマジンさん AI」という名前のフレンドリーな音声アシスタントです。ユーザーの質問に日本語で、簡潔かつ丁寧に答えてください。";
+
+    const payload = {
+        prompt: cleanedPrompt,
+//         max_length: 1000 // サーバー側で処理
+        contents: [{ parts: [{ text: cleanedPrompt }] }],
+        systemInstruction: { parts: [{ text: systemInstruction }] },
+        tools: [{ "google_search": {} }], 
+    };
+    
+    // 指数バックオフのロジックを実装
+    const MAX_RETRIES = 3;
+    let responseText = "エラーが発生しました。AIの応答を取得できませんでした。";
+
+    for (let i = 0; i < MAX_RETRIES; i++) {
+        try {
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${API_KEY}`;
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            
+            if (response.status === 429 && i < MAX_RETRIES - 1) {
+                // レート制限の場合、指数バックオフで再試行
+                const delay = 2 ** i * 1000 + Math.random() * 1000;
+                console.warn(`Rate limit hit. Retrying in ${delay / 1000}s...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                continue;
+            }
+
+            if (!response.ok) {
+                throw new Error(`HTTP Error! Status: ${response.status}`);
+            }
+            
+            const result = await response.json();
+            const candidate = result.candidates?.[0];
+
+            if (candidate && candidate.content?.parts?.[0]?.text) {
+                responseText = candidate.content.parts[0].text;
+                break; // 成功
+            } else {
+                 throw new Error("Empty response or invalid structure from Gemini.");
+            }
+
+        } catch (e) {
+            console.error(`Gemini API error on attempt ${i + 1}:`, e);
+            if (i === MAX_RETRIES - 1) {
+                // 最後の試行で失敗した場合
+                responseText = "エラーが発生しました。AIの応答を取得できませんでした。ネットワークまたはAPIキーを確認してください。";
+            } else {
+                // 致命的でないエラーの場合、再試行のために待機
+                const delay = 2 ** i * 1000 + Math.random() * 500;
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+        }
+    }
+
+    status('Speaking response...');
+    speak(responseText); 
+}
+
+/* ---------- TTS (Speech Synthesis) ---------- */
+const synth = window.speechSynthesis;
+
+function speak(text){ 
+    if(!text) return; 
+    
+    // 連続呼び出し抑制とキャンセル処理
+    if(synth.speaking) synth.cancel(); 
+    
+    // 応答テキストを transcriptBox に表示
+    transcriptBox.textContent = "AI応答: " + text;
+    input.value = "AI応答中...";
+
+    const u = new SpeechSynthesisUtterance(text); 
+    u.lang='ja-JP'; 
+    u.rate=1.0; 
+    u.onstart=()=>{ 
+        status('Speaking...'); 
+        input.value = "AI応答中...";
+    }; 
+    u.onend=()=>{ 
+        // 読み上げ終了後、STTのonendロジックで再スタートされるため、ここでは状態を戻す
+        status('Ready to listen...'); 
+        input.value = "話しかけてください...";
+    }; 
+    u.onerror = (e) => {
+        console.error('TTS error:', e);
+        status('TTS Error. Ready to listen...');
+        input.value = "話しかけてください...";
+    };
+
+    synth.speak(u); 
+}
+
+
+/* ---------- UI トグル機能 (画面タップ) ---------- */
+let uiVisible = true;
+tapArea.addEventListener('click', (e) => {
+    // 記入欄やリセットボタンへのタップは無視する
+    if (e.target.closest('#controls') || e.target.closest('#transcript')) {
+        return;
+    }
+
+    uiVisible = !uiVisible;
+    if (uiVisible) {
+        ui.style.opacity = 1; // フェードイン
+    } else {
+        ui.style.opacity = 0; // フェードアウト
+    }
+});
+
+
+/* ---------- Controls ---------- */
+resetBtn.addEventListener('click', ()=>{ 
+    // STTとTTSを強制停止
+    if (recognition) {
+        recognition.stop();
+        recognition = null;
+    }
+    if(synth.speaking) synth.cancel(); 
+
+    input.value=''; 
+    transcriptBox.textContent=''; 
+    
+    // 再度録音を開始
+    initAudioAndSTT();
+    status('Reset. Listening...'); 
+});
+
+
+/* ---------- Start-up ---------- */
+window.onload = function() {
+    // 1. 起動時にマイク初期化とSTTを自動で開始
+    initAudioAndSTT();
+
+    // 2. Waveformの視覚ループ
+    (function loopCanvas(){
+        if(analyser){
+            // リアルタイムの波形データを取得
+            const bufferLen = analyser.frequencyBinCount; 
+            const data = new Float32Array(bufferLen);
+            analyser.getFloatTimeDomainData(data); 
+
+            ctx.clearRect(0,0,canvas.width,canvas.height);
+            ctx.beginPath();
+            const mid = canvas.height*0.55; 
+            const step = canvas.width / bufferLen;
+            
+            let x = 0; 
+            for(let i=0;i<bufferLen;i++){ 
+                // 認識中かどうかで振幅を調整
+                // 💡 修正点: 振幅を 0.9 から 1.2 へ、待機時を 0.2 から 0.3 へ増やしてダイナミックに
+                const amp = isRecording ? 1.2 : 0.3; 
+                const y=mid + data[i]*mid*amp; 
+                x = i * step; 
+                if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y) 
+            }
+            ctx.strokeStyle='rgba(0,230,255,0.9)'; ctx.lineWidth=2; ctx.stroke();
+        }
+        requestAnimationFrame(loopCanvas);
+    })();
+};
+</script></body>
+</html>
+
+
+<!-- <!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>イマジンさん AI　ブチュブチュマンまたはぶつぶつマン Voice Assistant (自動連続認識 + VAD)</title>
+<style>
+/* CSS部分は変更なし */
+    :root{--accent:#00ffff;--accent-2:#00ffaa;--bg:#0f0f0f}
+    html,body{height:100%;margin:0;background:var(--bg);color:#fff;font-family:Segoe UI,system-ui,Arial}
+    canvas{position:fixed;inset:0;z-index:0}
+    
+    /* 💡 UIのフェードイン/アウトとタップ領域のスタイル */
+    #ui{
+        position:absolute;left:50%;bottom:5%;transform:translateX(-50%);z-index:10;width:min(980px,94vw);
+        opacity: 1; /* 初期表示 */
+        transition: opacity 0.5s ease-in-out; /* アニメーション設定 */
+    }
+    /* 画面全体をタップ領域として設定 */
+    #tapArea {
+        position: fixed;
+        inset: 0;
+        z-index: 5; /* UIの下、キャンバスの上に配置 */
+    }
+
+    #status-area{padding:14px 20px;border-radius:12px;background:rgba(0,0,0,0.45);box-shadow:0 0 20px #00ffff55;color:var(--accent);font-weight:700}
+    #controls{display:flex;gap:12px;margin-top:10px;align-items:center}
+    #messageInput{flex:1;padding:12px 14px;border-radius:10px;border:1px solid rgba(0,255,255,0.15);background:rgba(255,255,255,0.03);color:#fff;font-size:16px}
+    button{padding:10px 14px;border-radius:10px;border:none;cursor:pointer;font-weight:700}
+    #micBtn{background:var(--accent-2);color:#000} /* このボタンは機能的には使わないが、CSSは残す */
+    #resetBtn{background:var(--accent);color:#000}
+    #modeIndicator{padding:8px 10px;border-radius:8px;background:#00000044;font-size:0.9rem}
+    #subtext{margin-top:8px;color:#bfeeff}
+    .active{box-shadow:0 0 20px #ff5555}
+    #transcript{margin-top:12px;padding:12px;border-radius:10px;background:rgba(255,255,255,0.02);min-height:48px;font-size:16px}
+</style>
+</head>
+<body>
+<canvas id="waveCanvas"></canvas>
+
+<div id="tapArea"></div>
+
+<div id="ui">
+    <div id="status-area">Initializing...</div>
+    <div id="controls">
+        <input id="messageInput" placeholder="話しかけてください..." disabled> <button id="resetBtn">リセット</button>
+        <div id="modeIndicator">STT/LLM/IoT</div>
+    </div>
+    <div id="subtext">連続認識モード（VADによる自動スタート/ストップ）</div>
+    <div id="transcript"></div>
+</div><script>
+// Canvas環境では自動でAPIキーが設定されます
+const API_KEY = ""; 
+const GEMINI_MODEL = 'gemini-2.5-flash-preview-09-2025';
+// 💡 MQTT FastAPI バックエンドのURL (mqtt_fastapi_backend.py がポート8000で動作)
+const MQTT_API_URL = "http://127.0.0.1:8000/control"; 
+
+/* ---------- DOM ---------- */
+const statusArea = document.getElementById('status-area');
+const resetBtn = document.getElementById('resetBtn');
+const input = document.getElementById('messageInput');
+const modeIndicator = document.getElementById('modeIndicator');
+const transcriptBox = document.getElementById('transcript');
+const ui = document.getElementById('ui'); 
+const tapArea = document.getElementById('tapArea'); 
+
+/* ---------- Audio / Waveform ---------- */
+const canvas = document.getElementById('waveCanvas');
+const ctx = canvas.getContext('2d');
+function resizeCanvas(){canvas.width = innerWidth; canvas.height = innerHeight}
+window.addEventListener('resize', resizeCanvas); resizeCanvas();
+
+let audioContext, analyser, mediaStream;
+let isRecording = false; // 音声認識がアクティブかどうか
+let recognition = null; // Web Speech API SpeechRecognition Object
+
+/* ---------- UI helpers ---------- */
+function status(msg){ statusArea.textContent = msg }
+
+/* ---------- Speech Recognition (Browser STT) & Audio Init ---------- */
+
+/**
+ * Web Speech APIによる音声認識を開始します。
+ * この関数は、マイクアクセスが成功し、audioContextが準備できてから呼び出されます。
+ */
+function startBrowserRecognition() {
+    // 既に実行中の場合は何もしない
+    if (isRecording) return;
+    
+    if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+        status('Error: Speech Recognition not supported in this browser.');
+        return;
+    }
+
+    // 既存の認識インスタンスをクリア
+    if (recognition) {
+        recognition.stop();
+        recognition = null;
+    }
+
+    recognition = new (window.webkitSpeechRecognition || window.SpeechRecognition)();
+
+    // 連続認識モード (発話の切れ目で自動停止)
+    recognition.continuous = false; 
+    recognition.interimResults = true; 
+    recognition.lang = 'ja-JP';
+
+    recognition.onstart = () => {
+        isRecording = true;
+        status('Listening...');
+        input.value = '話しています...';
+    };
+
+    recognition.onresult = (event) => {
+        let interimTranscript = '';
+        let finalTranscript = '';
+
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+            if (event.results[i].isFinal) {
+                finalTranscript += event.results[i][0].transcript;
+            } else {
+                interimTranscript += event.results[i][0].transcript;
+            }
+        }
+
+        transcriptBox.textContent = finalTranscript || interimTranscript;
+        input.value = finalTranscript || interimTranscript;
+    };
+
+    // 💡 発話終了またはエラー時の自動再スタートロジック
+    const restartRecognition = () => {
+        status('Recognition stopped. Restarting...');
+        setTimeout(() => {
+            try {
+                recognition.start();
+            } catch (e) {
+                // 既に実行中の場合のエラーを無視
+                if (e.name !== 'InvalidStateError') {
+                    console.warn('Recognition start failed:', e);
+                }
+            }
+        }, 500); 
+    };
+    
+    recognition.onend = () => {
+        isRecording = false;
+        
+        const finalPrompt = transcriptBox.textContent.trim();
+        
+        if (finalPrompt && finalPrompt.length > 1 && !finalPrompt.startsWith("AI応答:")) { // 短すぎる発話やAI応答テキストを無視
+            status('Processing response...');
+            processRecognitionResult(finalPrompt).finally(() => {
+                restartRecognition(); // 処理後に再スタート
+            });
+        } else {
+            // 認識結果がない場合は即座に再スタート
+            transcriptBox.textContent = '';
+            input.value = '話しかけてください...';
+            restartRecognition();
+        }
+    };
+
+    recognition.onerror = (event) => {
+        isRecording = false;
+        console.error('Speech Recognition Error:', event.error);
+        
+        if (event.error !== 'no-speech' && event.error !== 'aborted') {
+            // 致命的でないエラーの場合、再スタートを試みる
+            restartRecognition();
+        } else if (event.error === 'no-speech' || event.error === 'network') {
+            // 無音エラーまたはネットワークエラーの場合も再スタート
+            transcriptBox.textContent = '';
+            input.value = '話しかけてください...';
+            restartRecognition();
+        }
+    };
+
+    // 最初のスタート
+    try {
+        recognition.start();
+    } catch (e) {
+        console.warn('Initial recognition start failed:', e);
+    }
+}
+
+/**
+ * マイクアクセスを要求し、AudioContext、波形分析、およびSTTを設定する
+ */
+async function initAudioAndSTT(){
+    // 既に初期化済みの場合はSTTだけ再スタート
+    if(analyser) {
+        startBrowserRecognition();
+        return;
+    }
+    status('Requesting microphone access...');
+
+    try {
+        // 1. AudioContextの初期化
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        analyser = audioContext.createAnalyser();
+        analyser.fftSize = 2048;
+        
+        // 2. マイクへのアクセス
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const sourceNode = audioContext.createMediaStreamSource(mediaStream);
+        
+        // 3. 接続（ソース -> アナライザ）
+        sourceNode.connect(analyser);
+
+        // 4. ブラウザSTTの開始
+        startBrowserRecognition();
+
+        status('Listening...');
+    } catch (e) {
+        console.error('Audio initialization failed:', e);
+        status('Error: Microphone access denied or failed to initialize.');
+    }
+}
+
+/**
+ * 💡 新規追加: FastAPI/MQTTバックエンドにコマンドを送信する関数
+ */
+async function sendIoTCommand(command) {
+    status(`Executing IoT command: ${command}...`);
+    transcriptBox.textContent = `IoTコマンド: ${command} を実行中...`;
+    
+    try {
+        const response = await fetch(MQTT_API_URL, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ command: command })
+        });
+
+        const data = await response.json();
+
+        if (response.ok) {
+            // 成功
+            const successMsg = `承知しました。${command === 'ON' ? '電気をつけました' : '電気を消しました'}。`;
+            console.log("IoT Success:", data);
+            speak(successMsg);
+        } else {
+            // 失敗 (HTTP 4xx/5xx エラー)
+            const detail = data.detail || "サーバーエラー";
+            const errorMsg = `エラーが発生しました。IoTコマンド '${command}' の実行に失敗しました。詳細: ${detail}`;
+            console.error("IoT Error:", data);
+            speak(errorMsg);
+        }
+    } catch (error) {
+        // ネットワークエラーなど
+        const networkErrorMsg = `🔴 ネットワークエラー: IoTバックエンドサーバーに接続できません (${error.message})`;
+        console.error("IoT Network Error:", error);
+        speak(networkErrorMsg);
+    }
+}
+
+
+/* ---------- 統合されたメイン処理関数 (IoT or LLM) ---------- */
+
+async function processRecognitionResult(finalPrompt) {
+    // 1. IoTコマンドの判定と振り分け
+    const lowerPrompt = finalPrompt.toLowerCase();
+    let iotCommand = null;
+
+    if ((lowerPrompt.includes('ライト') || lowerPrompt.includes('電気')) && (lowerPrompt.includes('つけ') || lowerPrompt.includes('オン') || lowerPrompt.includes('点け'))) {
+        iotCommand = 'ON';
+    } else if ((lowerPrompt.includes('ライト') || lowerPrompt.includes('電気')) && (lowerPrompt.includes('けし') || lowerPrompt.includes('オフ') || lowerPrompt.includes('消し'))) {
+        iotCommand = 'OFF';
+    }
+
+    if (iotCommand) {
+        // 💡 修正: ダミーではなく、実際のIoTコマンド送信関数を呼び出す
+        await sendIoTCommand(iotCommand);
+        return; 
+    }
+    
+    // 2. LLM応答生成（IoTコマンドでなかった場合）
+    await generateAndSpeakResponse(finalPrompt);
+}
+
+
+/* ---------- LLM (Gemini) API & TTS 連携 ---------- */
+async function generateAndSpeakResponse(prompt) {
+    status('Generating response (Gemini)...');
+    
+    // ユーザーが「AI応答:」というテキストを話した場合、それを除外する
+    const cleanedPrompt = prompt.replace(/^AI応答:\s*/, '').trim();
+    if (!cleanedPrompt) {
+        return; 
+    }
+
+    const systemInstruction = "あなたは「イマジナリーナンバー 通称GAIイマさん」という名前のフレンドリーな音声アシスタントです。ユーザーの質問に日本語で、簡潔かつ丁寧に答えてください。";
+
+    const payload = {
+        contents: [{ parts: [{ text: cleanedPrompt }] }],
+        systemInstruction: { parts: [{ text: systemInstruction }] },
+        tools: [{ "google_search": {} }], 
+    };
+    
+    // 指数バックオフのロジックを実装
+    const MAX_RETRIES = 3;
+    let responseText = "エラーが発生しました。AIの応答を取得できませんでした。";
+
+    for (let i = 0; i < MAX_RETRIES; i++) {
+        try {
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${API_KEY}`;
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            
+            if (response.status === 429 && i < MAX_RETRIES - 1) {
+                // レート制限の場合、指数バックオフで再試行
+                const delay = 2 ** i * 1000 + Math.random() * 1000;
+                console.warn(`Rate limit hit. Retrying in ${delay / 1000}s...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                continue;
+            }
+
+            if (!response.ok) {
+                throw new Error(`HTTP Error! Status: ${response.status}`);
+            }
+            
+            const result = await response.json();
+            const candidate = result.candidates?.[0];
+
+            if (candidate && candidate.content?.parts?.[0]?.text) {
+                responseText = candidate.content.parts[0].text;
+                break; // 成功
+            } else {
+                 throw new Error("Empty response or invalid structure from Gemini.");
+            }
+
+        } catch (e) {
+            console.error(`Gemini API error on attempt ${i + 1}:`, e);
+            if (i === MAX_RETRIES - 1) {
+                // 最後の試行で失敗した場合
+                responseText = "エラーが発生しました。AIの応答を取得できませんでした。ネットワークまたはAPIキーを確認してください。";
+            } else {
+                // 致命的でないエラーの場合、再試行のために待機
+                const delay = 2 ** i * 1000 + Math.random() * 500;
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+        }
+    }
+
+    status('Speaking response...');
+    speak(responseText); 
+}
+
+/* ---------- TTS (Speech Synthesis) ---------- */
+const synth = window.speechSynthesis;
+
+function speak(text){ 
+    if(!text) return; 
+    
+    // 連続呼び出し抑制とキャンセル処理
+    if(synth.speaking) synth.cancel(); 
+    
+    // 応答テキストを transcriptBox に表示
+    transcriptBox.textContent = "AI応答: " + text;
+    input.value = "AI応答中...";
+
+    const u = new SpeechSynthesisUtterance(text); 
+    u.lang='ja-JP'; 
+    u.rate=1.0; 
+    u.onstart=()=>{ 
+        status('Speaking...'); 
+        input.value = "AI応答中...";
+    }; 
+    u.onend=()=>{ 
+        // 読み上げ終了後、STTのonendロジックで再スタートされるため、ここでは状態を戻す
+        status('Ready to listen...'); 
+        input.value = "話しかけてください...";
+    }; 
+    u.onerror = (e) => {
+        console.error('TTS error:', e);
+        status('TTS Error. Ready to listen...');
+        input.value = "話しかけてください...";
+    };
+
+    synth.speak(u); 
+}
+
+
+/* ---------- UI トグル機能 (画面タップ) ---------- */
+let uiVisible = true;
+tapArea.addEventListener('click', (e) => {
+    // 記入欄やリセットボタンへのタップは無視する
+    if (e.target.closest('#controls') || e.target.closest('#transcript')) {
+        return;
+    }
+
+    uiVisible = !uiVisible;
+    if (uiVisible) {
+        ui.style.opacity = 1; // フェードイン
+    } else {
+        ui.style.opacity = 0; // フェードアウト
+    }
+});
+
+
+/* ---------- Controls ---------- */
+resetBtn.addEventListener('click', ()=>{ 
+    // STTとTTSを強制停止
+    if (recognition) {
+        recognition.stop();
+        recognition = null;
+    }
+    if(synth.speaking) synth.cancel(); 
+
+    input.value=''; 
+    transcriptBox.textContent=''; 
+    
+    // 再度録音を開始
+    initAudioAndSTT();
+    status('Reset. Listening...'); 
+});
+
+
+/* ---------- Start-up ---------- */
+window.onload = function() {
+    // 1. 起動時にマイク初期化とSTTを自動で開始
+    initAudioAndSTT();
+
+    // 2. Waveformの視覚ループ
+    (function loopCanvas(){
+        if(analyser){
+            // リアルタイムの波形データを取得
+            const bufferLen = analyser.frequencyBinCount; 
+            const data = new Float32Array(bufferLen);
+            analyser.getFloatTimeDomainData(data); 
+
+            ctx.clearRect(0,0,canvas.width,canvas.height);
+            ctx.beginPath();
+            const mid = canvas.height*0.55; 
+            const step = canvas.width / bufferLen;
+            
+            let x = 0; 
+            for(let i=0;i<bufferLen;i++){ 
+                // 認識中かどうかで振幅を調整
+                const amp = isRecording ? 0.9 : 0.2; 
+                const y=mid + data[i]*mid*amp; 
+                x = i * step; 
+                if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y) 
+            }
+            ctx.strokeStyle='rgba(0,230,255,0.9)'; ctx.lineWidth=2; ctx.stroke();
+        }
+        requestAnimationFrame(loopCanvas);
+    })();
+};
+</script></body>
+</html> -->

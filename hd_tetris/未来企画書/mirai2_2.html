@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>AI音声入力アシスタントUI (ボリューム連動版) - 補正済み</title>
+    <style>
+        /* ---------------------------------------------------- */
+        /* 1. 基本設定とフォント補正（ズレ対策）                 */
+        /* ---------------------------------------------------- */
+        :root {
+            /* 基本色 */
+            --color-bg: #0f0f0f;
+            --color-main: #00ffff;
+            --color-text: #fff;
+            --color-recording: #ffff00;
+            --color-speaking: #00ffaa;
+            /* 影の透明度を統一 (80%透明) */
+            --shadow-opacity: 80; 
+            /* パディング/マージン */
+            --safe-bottom: env(safe-area-inset-bottom);
+            /* ボリューム連動初期シャドウ */
+            --initial-shadow: 0 0 5px var(--color-main)33; /* 初期値を控えめに */
+        }
+
+        body {
+            margin: 0;
+            background: var(--color-bg);
+            /* フォントをシステムフォントに統一して、表示のズレを最小化 */
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+            overflow: hidden;
+            color: var(--color-text);
+            /* マイクの初回アクセス時にスクロールが発生しないように、全体の高さを固定 */
+            height: 100vh;
+        }
+
+        /* 背景の波形 Canvas */
+        #waveCanvas {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            z-index: 0;
+        }
+
+        /* ---------------------------------------------------- */
+        /* 2. UIコンテナ (レスポンシブ対応)                     */
+        /* ---------------------------------------------------- */
+        #ui {
+            position: absolute;
+            /* bottomの計算ロジックをよりシンプルに */
+            bottom: calc(5% + var(--safe-bottom)); 
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 1rem; /* スマホ向けに少しコンパクトに */
+            z-index: 10;
+            width: 90%;
+            max-width: 500px; /* PC/タブレットの最大幅を少し狭くして、モバイル体験を優先 */
+        }
+
+        /* ステータスエリア */
+        #status-area {
+            padding: 10px 15px; /* パディングを少し小さく */
+            background: rgba(0, 0, 0, 0.5); /* 透明度を少し上げる */
+            border-radius: 12px;
+            backdrop-filter: blur(8px); /* ブラー効果を上げる */
+            box-shadow: var(--initial-shadow);
+            color: var(--color-main);
+            font-size: 1.05rem; /* スマホ向けに調整 */
+            font-weight: bold;
+            min-height: 40px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 100%;
+            text-align: center;
+            line-height: 1.3;
+            /* シャドウの変化をスムーズかつ敏感に */
+            transition: color 0.5s, box-shadow 0.08s ease-out; 
+        }
+        
+        /* 画面中央の認識結果エリア (非表示を継続) */
+        #transcript {
+            /* スタイルは既存のものを維持、今回は機能しないため非表示 */
+            display: none; 
+        }
+
+        /* ---------------------------------------------------- */
+        /* 3. 入力とボタンのスタイル                              */
+        /* ---------------------------------------------------- */
+        #input-controls {
+            display: flex;
+            gap: 0.7rem; /* 隙間をさらに小さく */
+            width: 100%;
+        }
+
+        #messageInput {
+            flex-grow: 1;
+            padding: 0.8rem 1rem; /* 縦パディングを少し減らす */
+            font-size: 1.0rem; 
+            background: rgba(255, 255, 255, 0.1); /* 背景色をより暗く */
+            border: 1px solid rgba(0, 255, 255, 0.4);
+            color: var(--color-text);
+            border-radius: 8px;
+            backdrop-filter: blur(10px);
+            outline: none;
+            /* line-heightで高さを調整し、paddingと合わせて安定させる */
+            line-height: 1.5; 
+            height: 48px; /* 高さを明示的に指定 */
+            box-sizing: border-box; 
+        }
+
+        #messageInput::placeholder {
+            color: rgba(255, 255, 255, 0.4);
+        }
+
+        #sendBtn {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            
+            /* 入力欄の高さと合わせる */
+            height: 48px; 
+            width: 100px; /* 幅を固定して見た目を安定させる */
+            min-width: 90px;
+            padding: 0; 
+            
+            color: var(--color-bg);
+            background: var(--color-main);
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            backdrop-filter: blur(10px);
+            transition: background 0.3s, box-shadow 0.3s;
+            box-shadow: 0 0 12px var(--color-main); 
+            font-weight: bold;
+            line-height: 1.2;
+            font-size: 0.9rem; 
+            white-space: nowrap; /* テキストの改行を防ぐ */
+        }
+        
+        #sendBtn:hover {
+            background: #66ffff;
+            box-shadow: 0 0 18px #66ffff;
+        }
+
+        /* ---------------------------------------------------- */
+        /* 4. メディアクエリ (PC向け最適化)                       */
+        /* ---------------------------------------------------- */
+        @media (min-width: 601px) {
+            #ui {
+                bottom: calc(5% + var(--safe-bottom)); /* PCでも中央寄りに */
+                gap: 1.2rem;
+            }
+
+            #status-area {
+                font-size: 1.1rem;
+                padding: 12px 20px;
+            }
+            
+            #messageInput {
+                font-size: 1.1rem;
+                height: 52px;
+            }
+            
+            #sendBtn {
+                font-size: 1.0rem;
+                height: 52px;
+                width: 120px;
+            }
+        }
+        
+        /* 5. タップ検出エリア (UIトグル用) */
+        #tapArea {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            z-index: 1;
+        }
+    </style>
+</head>
+
+<body>
+    <canvas id="waveCanvas"></canvas>
+    <div id="tapArea"></div>
+
+    <div id="transcript"></div>
+
+    <div id="ui">
+        <div id="status-area">
+            イマジナリーナンバー<br>
+            通称GAIイマさんAI<br>
+            AIアシスタント待機中...
+        </div>
+
+        <div id="input-controls">
+            <input type="text" id="messageInput" placeholder="ここに文章を入力するか、マイクをタップして話してください...">
+
+            <button id="sendBtn">
+                AIに送信<br>
+                /マイク
+            </button>
+        </div>
+    </div>
+
+    <script>
+        /* --------------------------------------------------- */
+        /* 1. CanvasアニメーションとUIの連動ロジック (変更なし) */
+        /* --------------------------------------------------- */
+
+        function resizeCanvas() {
+            const canvas = document.getElementById("waveCanvas");
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            createBars();
+        }
+
+        window.addEventListener("load", resizeCanvas);
+        window.addEventListener("resize", resizeCanvas);
+        window.addEventListener("orientationchange", () => {
+            setTimeout(resizeCanvas, 300);
+        });
+
+        const canvas = document.getElementById("waveCanvas");
+        const ctx = canvas.getContext("2d");
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+
+        let bars = [];
+        const barCount = 40;
+        const barWidth = 8;
+        let waveY;
+        
+        let audioContext, analyser, mediaStream;
+        let dataArray;
+        
+        let currentMicVolume = 0;
+        let animationFrameId;
+        let isSpeaking = false;
+        let isRecording = false;
+        
+        function createBars() {
+            waveY = canvas.height / 2;
+            bars = [];
+            const gap = 2;
+            const totalWidth = barCount * barWidth + (barCount - 1) * gap;
+            const startX = canvas.width / 2 - totalWidth / 2;
+            
+            for (let i = 0; i < barCount; i++) {
+                bars.push({
+                    x: startX + i * (barWidth + gap),
+                    height: 10,
+                    color: "#00ffff"
+                });
+            }
+        }
+        createBars();
+
+        function drawBars() {
+            bars.forEach(bar => {
+                ctx.fillStyle = bar.color;
+                ctx.fillRect(bar.x, waveY - bar.height / 2, barWidth, bar.height);
+            });
+        }
+
+        function animateBars() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            let targetColor = '#00ffff';
+            currentMicVolume = 0;
+
+            if (isRecording && analyser && audioContext.state === 'running' && dataArray) {
+                analyser.getByteFrequencyData(dataArray);
+
+                let sumVolume = 0;
+                const step = Math.floor(dataArray.length / barCount);
+                
+                bars.forEach((bar, i) => {
+                    const volume = dataArray[i * step] / 255;
+                    sumVolume += dataArray[i * step];
+                    
+                    let targetHeight = volume * 180 + 20;
+                    
+                    targetColor = '#ffff00';
+                    bar.color = targetColor;
+
+                    bar.height += (targetHeight - bar.height) * 0.15;
+                });
+                
+                const averageVolume = sumVolume / barCount;
+                currentMicVolume = averageVolume / 255;
+
+            }
+            else if (isSpeaking) {
+                targetColor = '#00ffaa';
+                bars.forEach(bar => {
+                    let targetHeight = Math.random() * 80 + 20;
+                    
+                    bar.color = targetColor;
+                    
+                    bar.height += (targetHeight - bar.height) * 0.15;
+                });
+            }
+            else {
+                targetColor = '#00ffff';
+                bars.forEach(bar => {
+                    let targetHeight = 10 + Math.random() * 10;
+                    
+                    bar.color = targetColor;
+                    
+                    bar.height += (targetHeight - bar.height) * 0.15;
+                });
+            }
+
+            drawBars();
+            
+            updateMicUI(currentMicVolume, targetColor);
+            
+            animationFrameId = requestAnimationFrame(animateBars);
+        }
+
+        /* --------------------------------------------------- */
+        /* 2. 音声読み上げ/認識/API連携関連 (補正箇所あり)       */
+        /* --------------------------------------------------- */
+
+        const statusArea = document.getElementById("status-area");
+        const sendBtn = document.getElementById("sendBtn");
+        const input = document.getElementById("messageInput");
+        const transcriptBox = document.getElementById('transcript');
+        const tapArea = document.getElementById('tapArea');
+
+        // API設定 (ご自身の環境に合わせて変更してください)
+        const API_KEY = "";
+        const LLM_API_URL = "http://127.0.0.1:8001/generate";
+        const MQTT_API_URL = "http://127.0.0.1:8000/control";
+
+        const synth = window.speechSynthesis;
+        let recognition = null;
+        let isLLMProcessing = false;
+        let sttRetryCount = 0;
+        const MAX_STT_RETRY = 5;
+        
+        let currentStatusColor = '#00ffff';
+
+
+        /* ---------- UI helpers ---------- */
+        
+        /**
+         * 音量 (volume: 0.0-1.0) と現在の色に基づいてUIの影を更新する
+         */
+        function updateMicUI(volume, color) {
+            currentStatusColor = color;
+
+            let shadowIntensity = 0;
+            if (isRecording) {
+                // 録音中は音量に応じて強さ (8 + volume * 20) を動的に変化させる
+                shadowIntensity = Math.min(25, 8 + volume * 20); 
+            } else if (isSpeaking) {
+                // TTS中は一定の強さ (15px)
+                shadowIntensity = 15;
+            } else {
+                // 待機中は最小の強さ (5px)
+                shadowIntensity = 5;
+            }
+            
+            // CSS変数 --shadow-opacity (80) を利用して統一
+            const opacityHex = parseInt(document.documentElement.style.getPropertyValue('--shadow-opacity') || '80', 16).toString(16);
+
+            // ステータスエリアの影を音量/状態に連動
+            statusArea.style.boxShadow = `0 0 ${shadowIntensity}px ${color}${opacityHex}`;
+        }
+
+
+        function updateStatus(message, color = '#00ffff') {
+            statusArea.innerHTML = message;
+            statusArea.style.color = color;
+            currentStatusColor = color;
+        }
+
+        function setStandbyStatus() {
+            const standbyMsg = `
+            イマジナリーナンバー
+            通称GAIイマさんAI
+            AIアシスタント待機中...
+            `;
+            updateStatus(standbyMsg.trim(), '#00ffff');
+            sendBtn.innerHTML = 'AIに送信<br>/マイク';
+            sendBtn.style.background = '#00ffff';
+            sendBtn.style.boxShadow = '0 0 12px #00ffff';
+        }
+
+        /* ---------- TTS (Speech Synthesis) ---------- */
+
+        /**
+         * LLM応答など、AIからの正式な応答を読み上げ、終了後にSTTを再起動する
+         */
+        function speak(text) {
+            if (!text) return;
+
+            if (synth.speaking) synth.cancel();
+
+            isSpeaking = true;
+            isLLMProcessing = false;
+
+            const u = new SpeechSynthesisUtterance(text);
+            u.lang = 'ja-JP';
+            u.rate = 1.0;
+            u.onstart = () => {
+                // STTが動いていれば停止を試みる（TTSが優先）
+                if (recognition && isRecording) {
+                    try { recognition.stop(); } catch(e) {}
+                }
+                const display = text.length > 20 ? text.substring(0, 20) + '...' : text;
+                const formattedStatus = `
+                イマジナリーナンバー
+                通称GAIイマさんAI応答
+                「${display}」
+                `;
+                updateStatus(formattedStatus.trim(), '#00ffaa');
+            };
+            u.onend = () => {
+                isSpeaking = false;
+                setStandbyStatus();
+                input.value = '';
+
+                // TTS終了後、STTが停止していれば自動で再起動を試みる
+                if (recognition && !isRecording && !isLLMProcessing) {
+                    // LLM処理中でないことを確認して再起動
+                    startBrowserRecognition();
+                }
+            };
+            u.onerror = (e) => {
+                console.error('TTS error:', e);
+                isSpeaking = false;
+                setStandbyStatus();
+                input.value = '';
+            };
+
+            synth.speak(u);
+        }
+
+        /* ---------- LLM/IoT API連携 (モック) ---------- */
+
+        /**
+         * LLM API (およびIoT制御) にプロンプトを送信する
+         */
+        async function processRecognitionResult(prompt) {
+            if (isLLMProcessing) return;
+            isLLMProcessing = true;
+            
+            // ユーザーフィードバック
+            updateStatus(`ユーザー: 「${prompt.substring(0, 15)}...」<br>AI応答を処理中...`, '#0099ff');
+            sendBtn.innerHTML = '処理中...';
+            sendBtn.style.background = '#0099ff';
+            sendBtn.style.boxShadow = '0 0 12px #0099ff';
+
+
+            try {
+                // 1. まずIoT制御コマンドをチェックする（モック）
+                if (prompt.includes('電気') || prompt.includes('照明') || prompt.includes('エアコン')) {
+                    const iotResponse = `分かりました、${prompt}に対応するIoT制御コマンドを送信しました。`;
+                    speak(iotResponse);
+                    return;
+
+                }
+                
+                // 2. LLMからの応答を待つ（モック）
+                await new Promise(resolve => setTimeout(resolve, 2500)); // 2.5秒の遅延
+
+                const llmResponse = `「${prompt}」についてですね。AIによる詳細な応答がここに生成されます。ご質問ありがとうございます。`;
+                
+                speak(llmResponse); // TTSで読み上げ開始
+
+            } catch (error) {
+                console.error('API Error:', error);
+                const errorMsg = 'LLM/APIとの通信エラーが発生しました。';
+                updateStatus(errorMsg, '#ff0000');
+                speak(errorMsg);
+            } finally {
+                // isLLMProcessing = false; // TTSのonendで再開
+                sttRetryCount = 0; // 成功したのでリセット
+            }
+        }
+
+
+        /* ---------- Speech Recognition (Browser STT) & Audio Init ---------- */
+
+        /**
+         * AudioContextとAnalyserNodeを初期化する
+         */
+        async function initAudio() {
+            if (analyser) {
+                return true;
+            }
+            
+            try {
+                // ユーザーアクションを待つ必要があるため、ここでは AudioContext の初期化を試みる
+                if (!audioContext) {
+                     audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                if (audioContext.state === 'suspended') {
+                    // ユーザーアクションをトリガーにする
+                    await audioContext.resume();
+                }
+
+                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                const source = audioContext.createMediaStreamSource(mediaStream);
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = 256;
+                const bufferLength = analyser.frequencyBinCount;
+                dataArray = new Uint8Array(bufferLength);
+
+                source.connect(analyser);
+                
+                // アニメーション開始
+                if (!animationFrameId) {
+                    animateBars();
+                }
+                return true;
+            } catch (err) {
+                console.error('Mic access error:', err);
+                updateStatus('Error: マイクアクセスを許可してください。', '#ff0000');
+                return false;
+            }
+        }
+        
+        /**
+         * ブラウザの音声認識を開始する
+         */
+        function startBrowserRecognition() {
+            if (isRecording || isSpeaking || isLLMProcessing) return;
+
+            if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+                updateStatus('Error: このブラウザは音声認識をサポートしていません。', '#ff0000');
+                return;
+            }
+            
+            if (recognition) {
+                try { recognition.stop(); } catch(e) {}
+                recognition = null;
+            }
+
+            recognition = new (window.webkitSpeechRecognition || window.SpeechRecognition)();
+            recognition.continuous = false;
+            recognition.interimResults = true;
+            recognition.lang = 'ja-JP';
+            // 音声が止まってから認識を終了するまでの時間を調整
+            recognition.interimResults = false; 
+            recognition.maxAlternatives = 1;
+            recognition.serviceURI = ''; // サービスURIの指定は不要
+            
+
+            recognition.onstart = () => {
+                isRecording = true;
+                const standbyMsg = `
+                **Listening...**
+                話しかけてください...！
+                `;
+                updateStatus(standbyMsg.trim(), '#ffff00');
+                input.value = '';
+                
+                sendBtn.innerHTML = 'マイク停止';
+                sendBtn.style.background = '#ff6600';
+                sendBtn.style.boxShadow = '0 0 12px #ff6600';
+                sttRetryCount = 0;
+            };
+
+            recognition.onresult = (event) => {
+                let finalTranscript = '';
+                for (let i = event.resultIndex; i < event.results.length; ++i) {
+                    if (event.results[i].isFinal) {
+                        finalTranscript += event.results[i][0].transcript;
+                    }
+                }
+                // 認識結果をinputに反映
+                if (finalTranscript) {
+                    input.value = finalTranscript;
+                    // recognition.stop()はonendイベントをトリガーする
+                    // onendでLLM処理に流れる
+                    try { recognition.stop(); } catch(e) {}
+                }
+            };
+            
+            recognition.onend = () => {
+                isRecording = false;
+                
+                const finalPrompt = input.value.trim(); 
+                
+                if (finalPrompt && finalPrompt.length > 1) {
+                    processRecognitionResult(finalPrompt);
+                    // LLM処理中はSTT再起動はしない
+                } else {
+                    // 認識結果が空の場合（無言、または短いノイズ）、待機状態に戻して再起動を試みる
+                    setStandbyStatus();
+                    
+                    // エラーなく終了した場合は即時再起動
+                    if (!isSpeaking && !isLLMProcessing) {
+                        startBrowserRecognition();
+                    }
+                }
+            };
+
+            recognition.onerror = (event) => {
+                isRecording = false;
+                console.error('Speech Recognition Error:', event.error);
+
+                if (event.error === 'not-allowed') {
+                    updateStatus('Error: マイクアクセスを許可してください。', '#ff0000');
+                } else if (event.error === 'aborted') {
+                    // 意図的な停止 (stop()) や TTSによる停止 は無視
+                } else if (!isSpeaking && !isLLMProcessing && sttRetryCount < MAX_STT_RETRY) {
+                    // その他のエラー (network, no-speech, audio-capture) の場合、再試行
+                    sttRetryCount++;
+                    console.log(`STT retrying: ${sttRetryCount}`);
+                    // 一定のディレイを設けて、エラーの連鎖を防ぐ
+                    setTimeout(() => {
+                         // recognitionオブジェクトを完全に破棄して再生成
+                         recognition = null;
+                         startBrowserRecognition(); 
+                    }, 1000 * sttRetryCount); // 再試行回数に応じてディレイを長くする
+                } else {
+                    // 最大再試行回数を超えた
+                    updateStatus('Error: 音声認識ができませんでした。再試行を停止します。', '#ff0000');
+                    setStandbyStatus(); // 最終的に待機状態に戻す
+                }
+            };
+
+            try {
+                recognition.start();
+            } catch (e) {
+                console.warn('Initial recognition start failed:', e);
+            }
+        }
+        
+        
+        /**
+         * STTを強制的に停止し、待機状態に戻す
+         */
+        function stopAndResetRecognition() {
+            if (isRecording && recognition) {
+                try {
+                    // recognition.stop()を呼び出すことで、onend/onerrorに流れ、そこでisRecording=false、setStandbyStatus()が呼ばれる
+                    recognition.stop();
+                } catch(e) {
+                    console.warn('Recognition stop failed:', e);
+                    // エラーで停止できなかった場合、手動でリセット
+                    isRecording = false;
+                    setStandbyStatus();
+                }
+            } else {
+                setStandbyStatus();
+            }
+        }
+        
+        
+        /* ---------- イベントハンドラ ---------- */
+        
+        // 1. sendBtn (送信/マイクボタン) のクリックイベント
+        sendBtn.addEventListener('click', async () => {
+            if (isSpeaking || isLLMProcessing) return; 
+
+            if (isRecording) {
+                // 録音中の場合は停止させる
+                stopAndResetRecognition();
+                return;
+            }
+            
+            const prompt = input.value.trim();
+
+            if (prompt) {
+                // テキスト入力がある場合は、そのままLLM処理へ
+                if (recognition) recognition.stop();
+                
+                processRecognitionResult(prompt);
+
+            } else {
+                // テキスト入力がない場合は、マイクを起動
+                updateStatus('マイク起動中...');
+                const audioReady = await initAudio();
+                if (audioReady) {
+                    startBrowserRecognition();
+                }
+            }
+        });
+        
+        // 2. テキスト入力フィールドでEnterキーを押した場合のイベント
+        input.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                sendBtn.click();
+            }
+        });
+
+        /* ---------- 初期化処理 ---------- */
+
+        setStandbyStatus();
+        
+        if (!animationFrameId) {
+            animateBars();
+        }
+
+        // ページロード後、マイクアクセスとSTTの開始を試みる
+        window.addEventListener('load', async () => {
+            // initAudio()はユーザーアクション後に呼ばれるべきだが、ここでは自動起動を試みる
+            const audioReady = await initAudio();
+            if (audioReady) {
+                // マイクアクセス成功後、自動でSTTを開始
+                startBrowserRecognition();
+            }
+        });
+        
+    </script>
+</body>
+</html>

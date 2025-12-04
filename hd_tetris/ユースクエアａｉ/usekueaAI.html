@@ -1,0 +1,780 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ユースクエアAI - 音声アシスタント</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+    // 1. 右クリック（コンテキストメニュー）を禁止する
+    document.addEventListener('contextmenu', function(e) {
+        // デフォルトのコンテキストメニュー表示を阻止する
+        e.preventDefault();
+        console.log("右クリックは禁止されています。");
+        // オプション：ユーザーにメッセージを表示する
+        // alert("ページのソース閲覧やコピーは許可されていません。");
+    });
+
+    // 2. F12キーやCtrl/Cmd+Uを無効にする
+    document.onkeydown = function(e) {
+        // キーコードの取得 (e.keyはモダンなブラウザで推奨)
+        const key = e.key;
+        
+        // F12キー (開発者ツール)
+        if (key === 'F12') {
+            e.preventDefault();
+            console.log("F12キー操作は禁止されています。");
+            return false;
+        }
+
+        // Ctrl+Shift+I, Cmd+Option+I (開発者ツールのショートカット)
+        if (e.ctrlKey && e.shiftKey && key === 'I') {
+            e.preventDefault();
+            console.log("開発者ツールのショートカットは禁止されています。");
+            return false;
+        }
+
+        // Ctrl+U, Cmd+U (ページのソース表示のショートカット)
+        if (e.ctrlKey && key === 'u' || e.ctrlKey && key === 'U') {
+            e.preventDefault();
+            console.log("ソース表示のショートカットは禁止されています。");
+            return false;
+        }
+    };
+</script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0d1117;
+            color: #ffffff;
+            overflow: hidden; /* Canvasが全画面を占めるため */
+        }
+        #waveCanvas {
+            position: fixed;
+            top: 0;
+            left: 15;
+            z-index: 0;
+        }
+        #tapArea {
+            position: fixed;
+            top: 0;
+            left: 15;
+            width: 100%;
+            height: 100%;
+            z-index: 20; /* Canvasの上に配置 */
+        }
+        #ui {
+            transition: opacity 0.5s ease-in-out;
+            opacity: 1;
+            z-index: 30; /* 最前面に配置 */
+        }
+        #status-area {
+            font-size: 1.25rem;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            min-height: 100px;
+            text-shadow: 0 0 10px rgba(0, 255, 255, 0.5);
+            transition: color 0.3s, box-shadow 0.3s;
+            border-radius: 0.45rem;
+            padding: 1rem;
+        }
+    </style>
+</head>
+<body>
+    <!-- 1. Waveform Canvas (Full Screen) -->
+    <canvas id="waveCanvas"></canvas>
+
+    <!-- 2. UI Tap Area (for showing/hiding UI) -->
+    <div id="tapArea"></div>
+
+    <!-- 3. Main UI Overlay -->
+    <div id="ui" class="fixed inset-0 flex flex-col justify-between items-center p-6 sm:p-10 pointer-events-none">
+        
+        <!-- Status Display Area (Top) -->
+        <div id="status-area" class="text-center font-mono font-bold mt-10 w-full max-w-lg pointer-events-auto bg-gray-900/70 backdrop-blur-sm shadow-2xl border border-cyan-500/30">
+            AIアシスタント起動中...
+        </div>
+
+        <!-- Input Controls (Bottom) -->
+        <div id="input-controls" class="w-full max-w-xl flex flex-col items-center space-y-4 mb-4 sm:mb-8 pointer-events-auto">
+            
+            <!-- Transcript/Input Box -->
+            <textarea id="messageInput" class="w-full p-3 text-lg rounded-xl shadow-lg bg-gray-800/90 text-white placeholder-gray-400 border border-purple-500/50 focus:outline-none focus:ring-2 focus:ring-cyan-400 resize-none transition duration-300" 
+                      placeholder="ここにテキストを入力するか、話しかけてください..." rows="2"></textarea>
+            
+            <!-- Send/Reset Button -->
+            <button id="sendBtn" class="w-16 h-16 rounded-full bg-indigo-600 hover:bg-indigo-500 transition duration-300 transform hover:scale-105 shadow-xl text-white text-3xl flex items-center justify-center font-bold border-4 border-white/50 focus:outline-none focus:ring-4 focus:ring-pink-400/50">
+                <span role="img" aria-label="Reset/Send">✈︎</span>
+            </button>
+            <div class="text-xs text-gray-400 mt-2">（✈︎ボタンでリセット/マイク再起動、または画面タップでUI表示切替）</div>
+        </div>
+    </div>
+    
+    <!-- JavaScript Logic -->
+    <script>
+        /* ----------- スマホ回転時にもCanvasをフィットさせる ----------- */
+        function resizeCanvas() {
+            const canvas = document.getElementById("waveCanvas");
+            // 画面のサイズに合わせてCanvasのサイズを調整
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            // バーの位置を再計算
+            if (typeof createBars === 'function') {
+                createBars();
+            }
+        }
+
+        window.addEventListener("load", resizeCanvas);
+        window.addEventListener("resize", resizeCanvas);
+        window.addEventListener("orientationchange", () => {
+            // 回転後の値が安定してから再計算
+            setTimeout(resizeCanvas, 300); 
+        });
+
+        /* ---------- Canvasアニメーション関連 ---------- */
+        const canvas = document.getElementById("waveCanvas");
+        const ctx = canvas.getContext("2d");
+        
+        // 初期のCanvasサイズ設定（resizeCanvasで上書きされる）
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+
+        let bars = [];
+        const barCount = 40;
+        const barWidth = 8;
+        let waveY = canvas.height / 2; // 中央Y座標
+        let dataArray; 
+        
+        let animationFrameId;
+        let isSpeaking = false; 
+        let isRecording = false; 
+
+        function createBars() {
+            // Canvasサイズ変更に伴い、中央Y座標とバーを再初期化
+            waveY = canvas.height / 2;
+            bars = [];
+            // バーを中央に配置するための開始X座標を計算
+            const startX = canvas.width / 2 - (barCount * barWidth) / 2;
+            for (let i = 0; i < barCount; i++) {
+                bars.push({
+                    x: startX + i * barWidth * 2.5, // 間隔を広げるため * 2.5
+                    height: 10,
+                    // 待機時の色
+                    color: "#00ffff"
+                });
+            }
+        }
+
+        function drawBars() {
+            bars.forEach(bar => {
+                ctx.fillStyle = bar.color;
+                // バーを中心に描画
+                ctx.fillRect(bar.x, waveY - bar.height / 2, barWidth * 2, bar.height); 
+            });
+        }
+
+        function animateBars() {
+            // 背景をクリア（Tailwindの背景色を活かす）
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            if (isRecording && analyser && audioContext.state === 'running' && dataArray) {
+                // マイク入力中の動的波形
+                analyser.getByteFrequencyData(dataArray);
+
+                const step = Math.floor(dataArray.length / barCount); 
+                
+                bars.forEach((bar, i) => {
+                    // 周波数データから音量を計算
+                    const volume = dataArray[i * step] / 255; 
+                    // ターゲットの高さを設定 (最小20、最大200)
+                    let targetHeight = volume * 180 + 20; 
+
+                    // スムーズなアニメーション（慣性）
+                    bar.height += (targetHeight - bar.height) * 0.15;
+                    // 色を黄色に設定
+                    bar.color = '#ffff00';
+                });
+
+            } else if (isSpeaking) {
+                // AI応答中の擬似的な動的波形 (TTS)
+                bars.forEach(bar => {
+                    // 最小20から最大100の範囲で動きをシミュレート
+                    let targetHeight = Math.random() * 80 + 20;
+                    bar.height += (targetHeight - bar.height) * 0.15;
+                    // 色を緑色に設定
+                    bar.color = '#00ffaa';
+                });
+            } else {
+                // 待機中の控えめな動き
+                bars.forEach(bar => {
+                    // 最小10から最大20の範囲でわずかに動く
+                    let targetHeight = 10 + Math.random() * 10;
+                    bar.height += (targetHeight - bar.height) * 0.15;
+                    // 色をシアンに設定
+                    bar.color = "#00ffff";
+                });
+            }
+
+            drawBars();
+            animationFrameId = requestAnimationFrame(animateBars);
+        }
+
+        
+        /* --- 2. 音声読み上げ/認識/API連携関連 --- */
+        
+        // DOM要素の取得
+        const statusArea = document.getElementById("status-area");
+        const sendBtn = document.getElementById("sendBtn"); 
+        const input = document.getElementById("messageInput"); 
+        // const transcriptBox = document.getElementById('transcript'); // 未使用
+        const ui = document.getElementById('ui'); 
+        const tapArea = document.getElementById('tapArea'); 
+        
+        // API設定 (ご自身の環境に合わせて変更してください)
+        const API_KEY = ""; 
+        // ローカルFastAPIバックエンドのURL
+        // const LLM_API_URL = "http://127.0.0.1:8001/generate";
+        // const MQTT_API_URL = "http://127.0.0.1:8000/control"; 
+        const LLM_API_URL = "https://atjmuwnwmtjw-nose.hf.space/llm/generate";
+        const MQTT_API_URL = "https://atjmuwnwmtjw-nose.hf.space/iot/control"; 
+
+        // 状態管理変数
+        const synth = window.speechSynthesis;
+        let audioContext, analyser, mediaStream;
+        let recognition = null; 
+        let currentTextToSpeak = ''; 
+        
+        // --- ヘルパー関数 (色の補間) ---
+        // このコードブロックは、ユーザーが提供したJSをそのまま使用しています。
+        function hexToRgb(hex) {
+            const bigint = parseInt(hex.slice(1), 16);
+            const r = (bigint >> 16) & 255;
+            const g = (bigint >> 8) & 255;
+            const b = bigint & 255;
+            return [r, g, b];
+        }
+
+        function rgbToHex(r, g, b) {
+            const toHex = (c) => ('0' + Math.max(0, Math.min(255, c)).toString(16)).slice(-2);
+            return '#' + toHex(Math.round(r)) + toHex(Math.round(g)) + toHex(Math.round(b));
+        }
+        
+        function startColorTransition(startColor, endColor, duration = 2000) {
+            const startTime = performance.now();
+            const startRgb = hexToRgb(startColor);
+            const endRgb = hexToRgb(endColor);
+
+            function interpolate(currentTime) {
+                const elapsed = currentTime - startTime;
+                const progress = Math.min(1, elapsed / duration);
+                
+                const r = startRgb[0] + (endRgb[0] - startRgb[0]) * progress;
+                const g = startRgb[1] + (endRgb[1] - startRgb[1]) * progress;
+                const b = startRgb[2] + (endRgb[2] - startRgb[2]) * progress; 
+                
+                const currentColor = rgbToHex(r, g, b);
+                
+                statusArea.style.color = currentColor;
+                statusArea.style.boxShadow = `0 0 20px ${currentColor}80`;
+
+                if (progress < 1) {
+                    requestAnimationFrame(interpolate);
+                }
+            }
+            
+            requestAnimationFrame(interpolate);
+        }
+        
+        /* ---------- UI helpers ---------- */
+
+        function updateStatus(message, color = '#00ffff') {
+            statusArea.innerHTML = message; 
+            statusArea.style.color = color;
+            statusArea.style.boxShadow = `0 0 20px ${color}80`;
+        }
+          function setStandbyStatus() {
+            const standbyMsg = `
+            ユースクエアAI
+            KS-903model8906-c4-70e
+            AIアシスタント待機中...
+            `;
+            updateStatus(standbyMsg.trim(), '#00ffff');
+        }
+        
+        
+        /* ---------- TTS (Speech Synthesis) ---------- */
+
+        /**
+         * LLM応答など、AIからの正式な応答を読み上げ、終了後にSTTを再起動する
+         */
+        function speak(text){ 
+            if(!text) return; 
+            
+            currentTextToSpeak = text; 
+            
+            if(synth.speaking) synth.cancel(); 
+            
+            isSpeaking = true; 
+
+            const u = new SpeechSynthesisUtterance(text); 
+            u.lang='ja-JP'; 
+            u.rate=1.0; 
+            u.onstart=()=>{ 
+                const display = text.length > 20 ? text.substring(0, 20) + '...' : text;
+                const formattedStatus = `
+                ユースクエアAI
+                KS-903model8906-c4-70eAPIの応答
+                「${display}」
+                `;
+                updateStatus(formattedStatus.trim(), '#00ffaa');
+
+              
+            }; 
+            u.onend=()=>{ 
+                isSpeaking = false; 
+                currentTextToSpeak = ''; 
+                setStandbyStatus();
+                input.value = '';
+
+                // TTS終了後、STTが停止していれば自動で再起動を試みる
+                if (recognition && !isRecording) {
+                    try {
+                        recognition.start();
+                    } catch(e) {
+                        console.warn('Recognition restart failed after TTS:', e);
+                    }
+                }
+            }; 
+            u.onerror = (e) => {
+                console.error('TTS error:', e);
+                isSpeaking = false;
+                currentTextToSpeak = '';
+                setStandbyStatus();
+                input.value = '';
+            };
+
+            synth.speak(u); 
+        }
+
+        /**
+         * テキスト入力時の即時プレビュー用読み上げ関数（グローバルスコープに移動）
+         */
+        function speakSentence(text) {
+            // テキストが空か、既に同じテキストの読み上げが開始されている場合は何もしない
+            if (text.trim() === '' || text === currentTextToSpeak) {
+                return;
+            }
+
+            // 新しい読み上げが開始されるので、現在の読み上げをキャンセル
+            if (synth.speaking) {
+                synth.cancel();
+            }
+            
+            currentTextToSpeak = text; // 新しい文章を記憶
+
+            const utterance = new SpeechSynthesisUtterance(text); // const/let を使用
+            utterance.lang = 'ja-JP'; // 日本語を設定
+            utterance.rate = 1.0; 
+
+            utterance.onstart = () => {
+                isSpeaking = true;
+                // 読み上げ中の文章を一部表示
+                const display = text.length > 20 ? text.substring(0, 20) + '...' : text;
+                updateStatus(`文章を読み上げ中: 「${display}」`, '#00ffaa');
+            };
+            
+            utterance.onend = () => {
+                isSpeaking = false;
+                // 即時プレビューが終わっても、待機中のステータスに戻すだけ
+                setStandbyStatus(); 
+            };
+
+            utterance.onerror = (event) => {
+                console.error('Speech Synthesis Error:', event);
+                isSpeaking = false;
+                updateStatus('読み上げエラーが発生しました', '#ff0000');
+            };
+
+            synth.speak(utterance);
+        }
+
+        /* ---------- Speech Recognition (Browser STT) & Audio Init ---------- */
+
+        function startBrowserRecognition() {
+            if (isRecording) return;
+            
+            if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+                updateStatus('Error: Speech Recognition not supported in this browser.', '#ff0000');
+                return;
+            }
+
+            if (recognition) {
+                recognition.stop();
+                recognition = null;
+            }
+
+            recognition = new (window.webkitSpeechRecognition || window.SpeechRecognition)();
+            recognition.continuous = false; 
+            recognition.interimResults = true; 
+            recognition.lang = 'ja-JP';
+
+            recognition.onstart = () => {
+                isRecording = true;
+                isSpeaking = true; 
+                const standbyMsg = `
+                Listening...
+                話しかけてください...！
+                `;
+                updateStatus(standbyMsg.trim(), '#ffff00');
+                startColorTransition('#ffff00', '#00ffaa', 2000); 
+                
+                input.value = ''; 
+                if (synth.speaking) synth.cancel(); 
+            };
+
+            recognition.onresult = (event) => {
+                let interimTranscript = '';
+                let finalTranscript = '';
+
+                for (let i = event.resultIndex; i < event.results.length; ++i) {
+                    if (event.results[i].isFinal) {
+                        finalTranscript += event.results[i][0].transcript;
+                    } else {
+                        interimTranscript += event.results[i][0].transcript;
+                    }
+                }
+                input.value = finalTranscript || interimTranscript; // 入力欄には反映
+            };
+
+            // 発話終了またはエラー時の自動再スタートロジック
+            const restartRecognition = () => {
+                isRecording = false;
+                
+                // TTSが動作中でなければ、待機状態に戻す
+                if (!synth.speaking) {
+                    isSpeaking = false; 
+                    setStandbyStatus();
+                }
+                
+                setTimeout(() => {
+                    try {
+                        // 既に認識が開始されている場合は何もしない
+                        if (!isRecording && !synth.speaking) recognition.start(); 
+                    } catch (e) {
+                        if (e.name !== 'InvalidStateError') {
+                            console.warn('Recognition start failed:', e);
+                        }
+                    }
+                }, 500); 
+            };
+            
+            recognition.onend = () => {
+                isRecording = false;
+                
+                // TTSが動作していない場合に限り isSpeaking を false に
+                if (!synth.speaking) {
+                    isSpeaking = false; 
+                }
+                
+                const finalPrompt = input.value.trim(); // transcriptBoxの代わりにinput.valueを使う
+                
+                // 認識結果が空でない、またはデフォルトメッセージでない場合のみ処理
+                if (finalPrompt && finalPrompt.length > 1 && !finalPrompt.startsWith("話しかけてください") && !finalPrompt.startsWith("ユースクエアAI  KS-903model8906-c4-70eAPIの応答:")) {
+                    updateStatus('Processing response...', '#00ffaa');
+                    
+                    // LLM処理中にSTTが自動で再起動しないように、.finallyでrestartRecognitionを呼ぶ
+                    processRecognitionResult(finalPrompt).finally(() => {
+                        // TTSが終了した後に再起動させる (speak関数内のonendでも実施されるため冗長ではあるが念のため)
+                        if (!synth.speaking) {
+                            restartRecognition(); 
+                        }
+                    });
+                } else {
+                    restartRecognition();
+                }
+            };
+
+            recognition.onerror = (event) => {
+                isRecording = false;
+                isSpeaking = false;
+                console.error('Speech Recognition Error:', event.error);
+                
+                if (event.error !== 'not-allowed' && event.error !== 'aborted') {
+                    restartRecognition();
+                } else if (event.error === 'aborted') {
+                    // 意図的な停止（stop()呼び出し）の場合もあるため、再起動
+                    restartRecognition(); 
+                } else {
+                    updateStatus('Error: Microphone permission denied or failed.', '#ff0000');
+                }
+            };
+
+            try {
+                recognition.start();
+            } catch (e) {
+                console.warn('Initial recognition start failed:', e);
+            }
+        }
+
+        async function initAudioAndSTT(){
+            // AudioContextが既に初期化されていればSTTのみ再開
+            if(analyser) {
+                startBrowserRecognition();
+                return;
+            }
+            updateStatus('Requesting microphone access...');
+
+            try {
+                // AudioContextの初期化
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                
+                // AudioContextがsuspendedの場合、再開を試みる（iOSなどで必要）
+                if (audioContext.state === 'suspended') {
+                    await audioContext.resume();
+                }
+
+                analyser = audioContext.createAnalyser();
+                analyser.fftSize = 2048;
+                
+                dataArray = new Uint8Array(analyser.frequencyBinCount);
+                
+                // マイクストリームの取得
+                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                const sourceNode = audioContext.createMediaStreamSource(mediaStream);
+                
+                // アナライザに接続（波形描画用）
+                sourceNode.connect(analyser);
+
+                // STTを開始
+                startBrowserRecognition();
+
+                updateStatus('Listening...', '#ffff00');
+            } catch (e) {
+                console.error('Audio initialization failed:', e);
+                updateStatus('Error: Microphone access denied or failed to initialize.', '#ff0000');
+            }
+        }
+
+        /**
+         * FastAPI/MQTTバックエンドにコマンドを送信する関数
+         */
+        async function sendIoTCommand(command) {
+            updateStatus(`Executing IoT command: ${command}...`, '#00ffaa');
+            
+            try {
+                const response = await fetch(MQTT_API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ command: command })
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    const successMsg = `承知しました。${command === 'ON' ? '電気をつけました' : '電気を消しました'}。`;
+                    speak(successMsg);
+                } else {
+                    const detail = data.detail || "サーバーエラー";
+                    const errorMsg = `エラーが発生しました。IoTコマンド '${command}' の実行に失敗しました。詳細: ${detail}`;
+                    speak(errorMsg);
+                }
+            } catch (error) {
+                const networkErrorMsg = `🔴 ネットワークエラー: IoTバックエンドサーバーに接続できません (${error.message})。アドレス: ${MQTT_API_URL}`;
+                speak(networkErrorMsg);
+            }
+        }
+
+
+        /* ---------- 統合されたメイン処理関数 (IoT or LLM) ---------- */
+
+        async function processRecognitionResult(finalPrompt) {
+            // 1. IoTコマンドの判定と振り分け
+            const lowerPrompt = finalPrompt.toLowerCase();
+            let iotCommand = null;
+
+            if ((lowerPrompt.includes('ライト') || lowerPrompt.includes('電気')) && (lowerPrompt.includes('つけ') || lowerPrompt.includes('オン') || lowerPrompt.includes('点け'))) {
+                iotCommand = 'ON';
+            } else if ((lowerPrompt.includes('ライト') || lowerPrompt.includes('電気')) && (lowerPrompt.includes('けし') || lowerPrompt.includes('オフ') || lowerPrompt.includes('消し'))) {
+                iotCommand = 'OFF';
+            }
+
+            if (iotCommand) {
+                await sendIoTCommand(iotCommand);
+                return; 
+            }
+            
+            // 2. LLM応答生成（IoTコマンドでなかった場合）
+            await generateAndSpeakResponse(finalPrompt);
+        }
+
+
+        /* ---------- LLM (Gemini) API & TTS 連携 ---------- */
+        async function generateAndSpeakResponse(prompt) {
+            updateStatus('Generating response (via FastAPI)...', '#00ffaa');
+            
+            const cleanedPrompt = prompt.replace(/^ユースクエアAI  KS-903model8906-c4-70eAPIの応答:\s*/, '').trim();
+            if (!cleanedPrompt) {
+                return; 
+            }
+
+            
+          　const systemInstruction = "あなたは「ユースクエアAI」という名称のKS-903model8906-c4-70eという音声アシスタントです。ユーザーの質問に日本語で、簡潔かつ丁寧に答えてください。";
+
+
+            // Gemini APIのペイロード
+            const payload = {
+                prompt: cleanedPrompt,
+                contents: [{ parts: [{ text: cleanedPrompt }] }],
+                systemInstruction: { parts: [{ text: systemInstruction }] },
+                tools: [{ "google_search": {} }], 
+                // 注意: APIキーはバックエンド側で処理されることを想定しています
+            };
+            
+           
+
+            const MAX_RETRIES = 3;
+            let responseText = "エラーが発生しました。ユースクエアAIのKS-903model8906-c4-70eの応答を取得できませんでした。Generaltebバックエンドサーバー (ポート8004) の実行状態とAPIキーを再確認してください。";
+
+            for (let i = 0; i < MAX_RETRIES; i++) {
+                try {
+                    const response = await fetch(LLM_API_URL, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                    
+                    if (!response.ok) {
+                        const errorData = await response.json().catch(() => ({ detail: `HTTP ${response.status} Error.` }));
+                        throw new Error(`FastAPI Error! Status: ${response.status}. Detail: ${errorData.detail}`);
+                    }
+                    
+                    const result = await response.json();
+                    
+                    if (result && result.text) {
+                        responseText = result.text;
+                        break; 
+                    } else {
+                        throw new Error("Empty response or invalid JSON structure from FastAPI.");
+                    }
+
+               } catch (e) {
+                    console.error(`FastAPI call error on attempt ${i + 1}:`, e);
+                    if (i === MAX_RETRIES - 1) {
+                        responseText = "エラーが発生しました。ユースクエアAIのKS-903model8906-c4-70eの応答を取得できませんでした。Generaltebバックエンドサーバー (ポート8004) の実行状態とAPIキーを確認してください。";
+                    } else {
+                        // 指数関数的バックオフ
+                        const delay = 2 ** i * 1000 + Math.random() * 500;
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                    }
+                }
+            }
+          
+
+            updateStatus('Speaking response...', '#00ffaa');
+            speak(responseText); 
+            
+            return Promise.resolve();
+        }
+
+        /* ---------- イベントハンドラの統合と定義 ---------- */
+
+        // テキスト入力欄のイベントを追加 (Enterキーで処理)
+        input.addEventListener('keydown', (e) => {
+            // Enterキーが押された場合（改行を防ぎ、処理を開始）
+            if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.altKey) {
+                e.preventDefault(); 
+                
+                const textPrompt = input.value.trim();
+                
+                if (textPrompt) {
+                    // 音声認識が実行中の場合は強制停止
+                    if (recognition && isRecording) {
+                        recognition.stop(); 
+                    }
+                    // TTSをキャンセル（即時読み上げを停止）
+                    if(synth.speaking) synth.cancel(); 
+                    
+                    // 処理を優先
+                    updateStatus('Processing text input...', '#ffff00');
+                    
+                    // LLM処理を実行
+                    processRecognitionResult(textPrompt).catch(error => {
+                        console.error("Text input processing failed:", error);
+                    }).finally(() => {
+                        // input.valueはspeakのonendでクリアされるため、ここでは何もしない
+                    });
+                }
+            }
+        });
+
+        // テキスト入力のたびに現在の内容を読み上げる機能の追加 (TTS即時プレビュー)
+        input.addEventListener('input', (event) => {
+            const currentText = input.value.trim();
+            
+            // 音声認識が実行中でない、かつ、AIが応答中でない場合にのみ実行
+            // かつ、現在のテキストが読み上げ中のテキストと異なる場合
+            if (!isRecording && !isSpeaking && currentText.length > 0 && currentText !== currentTextToSpeak) {
+                speakSentence(currentText); 
+            } else if (currentText.length === 0 && synth.speaking) {
+                // テキストが全て削除され、かつ読み上げ中の場合はキャンセルして待機状態に戻す
+                synth.cancel();
+                isSpeaking = false;
+                setStandbyStatus();
+            }
+        });
+
+        // リセットボタンの機能 (STTとTTSの強制停止と再起動)
+        sendBtn.addEventListener("click", () => {
+            if (recognition) {
+                recognition.stop();
+                recognition = null;
+            }
+            if(synth.speaking) synth.cancel(); 
+
+            // isSpeakingとisRecordingを強制的にfalseに
+            isSpeaking = false;
+            isRecording = false;
+
+            // AudioContextがsuspendedの場合、resumeを試みる
+            if (audioContext && audioContext.state === 'suspended') {
+                audioContext.resume().catch(e => console.error("AudioContext resume failed:", e));
+            }
+            
+            initAudioAndSTT();
+            updateStatus('リセットしました。マイク入力を開始しています...'); 
+        });
+
+
+        // UI トグル機能 (画面タップ) 
+        let uiVisible = true; 
+        tapArea.addEventListener('click', (e) => {
+            // リセットボタンへのタップは無視
+            if (e.target.closest('#input-controls') || e.target.closest('#status-area')) {
+                return;
+            }
+
+            uiVisible = !uiVisible;
+            if (uiVisible) {
+                ui.style.opacity = 1; 
+            } else {
+                ui.style.opacity = 0; 
+            }
+        });
+
+        /* ---------- Start-up ---------- */
+        window.onload = function() {
+            createBars();
+            animateBars();
+            initAudioAndSTT(); // マイク初期化とSTTを自動で開始
+            setStandbyStatus();
+            
+            // UIをデフォルトで表示状態にする
+            ui.style.opacity = 1; 
+            uiVisible = true;
+        }
+    </script>
+</body>
+</html>
+
+       
